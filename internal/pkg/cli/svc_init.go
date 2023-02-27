@@ -6,10 +6,15 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
+	"strings"
 
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
+	"github.com/aws/copilot-cli/internal/pkg/describe"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
+	"github.com/dustin/go-humanize/english"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/copilot-cli/internal/pkg/docker/dockerfile"
@@ -47,7 +52,7 @@ const (
 
 var (
 	fmtSvcInitSvcTypePrompt  = "Which %s best represents your service's architecture?"
-	svcInitSvcTypeHelpPrompt = fmt.Sprintf(`A %s is an internet-facing HTTP server managed by AWS App Runner that scales based on incoming requests.
+	svcInitSvcTypeHelpPrompt = fmt.Sprintf(`A %s is an internet-facing or private HTTP server managed by AWS App Runner that scales based on incoming requests.
 To learn more see: https://git.io/JEEfb
 
 A %s is an internet-facing HTTP server managed by Amazon ECS on AWS Fargate behind a load balancer.
@@ -58,10 +63,10 @@ To learn more see: https://git.io/JEEJt
 
 A %s is a private service that can consume messages published to topics in your application.
 To learn more see: https://git.io/JEEJY`,
-		manifest.RequestDrivenWebServiceType,
-		manifest.LoadBalancedWebServiceType,
-		manifest.BackendServiceType,
-		manifest.WorkerServiceType,
+		manifestinfo.RequestDrivenWebServiceType,
+		manifestinfo.LoadBalancedWebServiceType,
+		manifestinfo.BackendServiceType,
+		manifestinfo.WorkerServiceType,
 	)
 
 	fmtWkldInitNamePrompt     = "What do you want to %s this %s?"
@@ -81,14 +86,29 @@ You should set this to the port which your Dockerfile uses to communicate with t
 	svcInitPublisherHelpPrompt = `A publisher is an existing SNS Topic to which a service publishes messages. 
 These messages can be consumed by the Worker Service.`
 
+	svcInitIngressTypePrompt     = "Would you like to accept traffic from your environment or the internet?"
+	svcInitIngressTypeHelpPrompt = `"Environment" will configure your service as private.
+"Internet" will configure your service as public.`
+
 	wkldInitImagePrompt = fmt.Sprintf("What's the %s ([registry/]repository[:tag|@digest]) of the image to use?", color.Emphasize("location"))
 )
 
+const (
+	ingressTypeEnvironment = "Environment"
+	ingressTypeInternet    = "Internet"
+)
+
+var rdwsIngressOptions = []string{
+	ingressTypeEnvironment,
+	ingressTypeInternet,
+}
+
 var serviceTypeHints = map[string]string{
-	manifest.RequestDrivenWebServiceType: "App Runner",
-	manifest.LoadBalancedWebServiceType:  "Internet to ECS on Fargate",
-	manifest.BackendServiceType:          "ECS on Fargate",
-	manifest.WorkerServiceType:           "Events to SQS to ECS on Fargate",
+	manifestinfo.RequestDrivenWebServiceType: "App Runner",
+	manifestinfo.LoadBalancedWebServiceType:  "Internet to ECS on Fargate",
+	manifestinfo.BackendServiceType:          "ECS on Fargate",
+	manifestinfo.WorkerServiceType:           "Events to SQS to ECS on Fargate",
+	manifestinfo.StaticSiteType:              "Internet to CDN to S3 bucket",
 }
 
 type initWkldVars struct {
@@ -104,7 +124,8 @@ type initWkldVars struct {
 type initSvcVars struct {
 	initWkldVars
 
-	port uint16
+	port        uint16
+	ingressType string
 }
 
 type initSvcOpts struct {
@@ -130,16 +151,20 @@ type initSvcOpts struct {
 	wsPendingCreation bool
 
 	// Cache variables
-	df dockerfileParser
+	df             dockerfileParser
+	manifestExists bool
 
 	// Init a Dockerfile parser using fs and input path
 	dockerfile func(string) dockerfileParser
+	// Init a new EnvDescriber using environment name and app name.
+	initEnvDescriber func(string, string) (envDescriber, error)
 }
 
 func newInitSvcOpts(vars initSvcVars) (*initSvcOpts, error) {
-	ws, err := workspace.New()
+	fs := afero.NewOsFs()
+	ws, err := workspace.Use(fs)
 	if err != nil {
-		return nil, fmt.Errorf("workspace cannot be created: %w", err)
+		return nil, err
 	}
 
 	sessProvider := sessions.ImmutableProvider(sessions.UserAgentExtras("svc init"))
@@ -149,7 +174,6 @@ func newInitSvcOpts(vars initSvcVars) (*initSvcOpts, error) {
 	}
 	store := config.NewSSMStore(identity.New(sess), ssm.New(sess), aws.StringValue(sess.Config.Region))
 	prompter := prompt.New()
-	sel := selector.NewWorkspaceSelect(prompter, store, ws)
 	deployStore, err := deploy.NewStore(sessProvider, store)
 	if err != nil {
 		return nil, err
@@ -160,12 +184,16 @@ func newInitSvcOpts(vars initSvcVars) (*initSvcOpts, error) {
 		Store:    store,
 		Ws:       ws,
 		Prog:     termprogress.NewSpinner(log.DiagnosticWriter),
-		Deployer: cloudformation.New(sess),
+		Deployer: cloudformation.New(sess, cloudformation.WithProgressTracker(os.Stderr)),
+	}
+	sel, err := selector.NewLocalFileSelector(prompter, fs)
+	if err != nil {
+		return nil, err
 	}
 	opts := &initSvcOpts{
 		initSvcVars:  vars,
 		store:        store,
-		fs:           &afero.Afero{Fs: afero.NewOsFs()},
+		fs:           fs,
 		init:         initSvc,
 		prompt:       prompter,
 		sel:          sel,
@@ -180,6 +208,17 @@ func newInitSvcOpts(vars initSvcVars) (*initSvcOpts, error) {
 		}
 		opts.df = dockerfile.New(opts.fs, opts.dockerfilePath)
 		return opts.df
+	}
+	opts.initEnvDescriber = func(appName string, envName string) (envDescriber, error) {
+		envDescriber, err := describe.NewEnvDescriber(describe.NewEnvDescriberConfig{
+			App:         appName,
+			Env:         envName,
+			ConfigStore: opts.store,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("initiate env describer: %w", err)
+		}
+		return envDescriber, nil
 	}
 	return opts, nil
 }
@@ -206,7 +245,7 @@ func (o *initSvcOpts) Validate() error {
 			return err
 		}
 	}
-	if o.image != "" && o.wkldType == manifest.RequestDrivenWebServiceType {
+	if o.image != "" && o.wkldType == manifestinfo.RequestDrivenWebServiceType {
 		if err := validateAppRunnerImage(o.image); err != nil {
 			return err
 		}
@@ -214,11 +253,30 @@ func (o *initSvcOpts) Validate() error {
 	if err := validateSubscribe(o.noSubscribe, o.subscriptions); err != nil {
 		return err
 	}
+	if err := o.validateIngressType(); err != nil {
+		return err
+	}
 	return nil
 }
 
 // Ask prompts for and validates any required flags.
 func (o *initSvcOpts) Ask() error {
+	// NOTE: we optimize the case where `name` is given as a flag while `wkldType` is not.
+	// In this case, we can try reading the manifest, and set `wkldType` to the value found in the manifest
+	// without having to validate it. We can then short circuit the rest of the prompts for an optimal UX.
+	if o.name != "" && o.wkldType == "" {
+		// Best effort to validate the service name without type.
+		if err := o.validateSvc(); err != nil {
+			return err
+		}
+		shouldSkipAsking, err := o.manifestAlreadyExists()
+		if err != nil {
+			return err
+		}
+		if shouldSkipAsking {
+			return nil
+		}
+	}
 	if o.wkldType != "" {
 		if err := validateSvcType(o.wkldType); err != nil {
 			return err
@@ -233,47 +291,20 @@ func (o *initSvcOpts) Ask() error {
 			return err
 		}
 	}
-	if err := validateSvcName(o.name, o.wkldType); err != nil {
+	if err := o.validateSvc(); err != nil {
 		return err
 	}
-	if err := o.validateDuplicateSvc(); err != nil {
+	if err := o.askIngressType(); err != nil {
 		return err
 	}
-	localMft, err := o.mftReader.ReadWorkloadManifest(o.name)
-	if err == nil {
-		svcType, err := localMft.WorkloadType()
-		if err != nil {
-			return fmt.Errorf(`read "type" field for service %s from local manifest: %w`, o.name, err)
-		}
-		if o.wkldType != svcType {
-			return fmt.Errorf("manifest file for service %s exists with a different type %s", o.name, svcType)
-		}
-		log.Infof("Manifest file for service %s already exists. Skipping configuration.\n", o.name)
-		return nil
-	}
-	var (
-		errNotFound          *workspace.ErrFileNotExists
-		errWorkspaceNotFound *workspace.ErrWorkspaceNotFound
-	)
-	if !errors.As(err, &errNotFound) && !errors.As(err, &errWorkspaceNotFound) {
-		return fmt.Errorf("read manifest file for service %s: %w", o.name, err)
-	}
-	err = o.askDockerfile()
+	shouldSkipAsking, err := o.manifestAlreadyExists()
 	if err != nil {
 		return err
 	}
-	if o.dockerfilePath == "" {
-		if err := o.askImage(); err != nil {
-			return err
-		}
+	if shouldSkipAsking {
+		return nil
 	}
-	if err := o.askSvcPort(); err != nil {
-		return err
-	}
-	if err := o.askSvcPublishers(); err != nil {
-		return err
-	}
-	return nil
+	return o.askSvcDetails()
 }
 
 // Execute writes the service's manifest file and stores the service in SSM.
@@ -288,7 +319,7 @@ func (o *initSvcOpts) Execute() error {
 		}
 	}
 	// If the user passes in an image, their docker engine isn't necessarily running, and we can't do anything with the platform because we're not building the Docker image.
-	if o.image == "" {
+	if o.image == "" && !o.manifestExists {
 		platform, err := legitimizePlatform(o.dockerEngine, o.wkldType)
 		if err != nil {
 			return err
@@ -296,6 +327,11 @@ func (o *initSvcOpts) Execute() error {
 		if platform != "" {
 			o.platform = &platform
 		}
+	}
+	// Environments that are deployed and have​ only private subnets.
+	envs, err := envsWithPrivateSubnetsOnly(o.store, o.initEnvDescriber, o.appName)
+	if err != nil {
+		return err
 	}
 	manifestPath, err := o.init.Service(&initialize.ServiceProps{
 		WorkloadProps: initialize.WorkloadProps{
@@ -307,10 +343,12 @@ func (o *initSvcOpts) Execute() error {
 			Platform: manifest.PlatformArgsOrString{
 				PlatformString: o.platform,
 			},
-			Topics: o.topics,
+			Topics:                  o.topics,
+			PrivateOnlyEnvironments: envs,
 		},
 		Port:        o.port,
 		HealthCheck: hc,
+		Private:     strings.EqualFold(o.ingressType, ingressTypeEnvironment),
 	})
 	if err != nil {
 		return err
@@ -330,6 +368,25 @@ func (o *initSvcOpts) RecommendActions() error {
 	return nil
 }
 
+func (o *initSvcOpts) askSvcDetails() error {
+	if o.wkldType == manifestinfo.StaticSiteType {
+		return o.askStaticSite()
+	}
+	err := o.askDockerfile()
+	if err != nil {
+		return err
+	}
+	if o.dockerfilePath == "" {
+		if err := o.askImage(); err != nil {
+			return err
+		}
+	}
+	if err := o.askSvcPort(); err != nil {
+		return err
+	}
+	return o.askSvcPublishers()
+}
+
 func (o *initSvcOpts) askSvcType() error {
 	if o.wkldType != "" {
 		return nil
@@ -342,6 +399,13 @@ func (o *initSvcOpts) askSvcType() error {
 	}
 	o.wkldType = t
 	return nil
+}
+
+func (o *initSvcOpts) validateSvc() error {
+	if err := validateSvcName(o.name, o.wkldType); err != nil {
+		return err
+	}
+	return o.validateDuplicateSvc()
 }
 
 func (o *initSvcOpts) validateDuplicateSvc() error {
@@ -365,6 +429,11 @@ If you'd prefer a new default manifest, please manually delete the existing one.
 	return nil
 }
 
+func (o *initSvcOpts) askStaticSite() error {
+	// TODO: add file selection for generating svc manifest.
+	return nil
+}
+
 func (o *initSvcOpts) askSvcName() error {
 	name, err := o.prompt.Get(
 		fmt.Sprintf(fmtWkldInitNamePrompt, color.Emphasize("name"), "service"),
@@ -380,14 +449,42 @@ func (o *initSvcOpts) askSvcName() error {
 	return nil
 }
 
+func (o *initSvcOpts) askIngressType() error {
+	if o.wkldType != manifestinfo.RequestDrivenWebServiceType || o.ingressType != "" {
+		return nil
+	}
+
+	var opts []prompt.Option
+	for _, typ := range rdwsIngressOptions {
+		opts = append(opts, prompt.Option{Value: typ})
+	}
+
+	t, err := o.prompt.SelectOption(svcInitIngressTypePrompt, svcInitIngressTypeHelpPrompt, opts, prompt.WithFinalMessage("Reachable from:"))
+	if err != nil {
+		return fmt.Errorf("select ingress type: %w", err)
+	}
+	o.ingressType = t
+	return nil
+}
+
+func (o *initSvcOpts) validateIngressType() error {
+	if o.wkldType != manifestinfo.RequestDrivenWebServiceType {
+		return nil
+	}
+	if strings.EqualFold(o.ingressType, "internet") || strings.EqualFold(o.ingressType, "environment") {
+		return nil
+	}
+	return fmt.Errorf("invalid ingress type %q: must be one of %s.", o.ingressType, english.OxfordWordSeries(rdwsIngressOptions, "or"))
+}
+
 func (o *initSvcOpts) askImage() error {
 	if o.image != "" {
 		return nil
 	}
 
-	var validator prompt.ValidatorFunc
+	validator := prompt.RequireNonEmpty
 	promptHelp := wkldInitImagePromptHelp
-	if o.wkldType == manifest.RequestDrivenWebServiceType {
+	if o.wkldType == manifestinfo.RequestDrivenWebServiceType {
 		promptHelp = wkldInitAppRunnerImagePromptHelp
 		validator = validateAppRunnerImage
 	}
@@ -403,6 +500,38 @@ func (o *initSvcOpts) askImage() error {
 	}
 	o.image = image
 	return nil
+}
+
+func (o *initSvcOpts) manifestAlreadyExists() (bool, error) {
+	if o.wsPendingCreation {
+		return false, nil
+	}
+	localMft, err := o.mftReader.ReadWorkloadManifest(o.name)
+	if err != nil {
+		var (
+			errNotFound          *workspace.ErrFileNotExists
+			errWorkspaceNotFound *workspace.ErrWorkspaceNotFound
+		)
+		if !errors.As(err, &errNotFound) && !errors.As(err, &errWorkspaceNotFound) {
+			return false, fmt.Errorf("read manifest file for service %s: %w", o.name, err)
+		}
+		return false, nil
+	}
+	o.manifestExists = true
+
+	svcType, err := localMft.WorkloadType()
+	if err != nil {
+		return false, fmt.Errorf(`read "type" field for service %s from local manifest: %w`, o.name, err)
+	}
+	if o.wkldType != "" {
+		if o.wkldType != svcType {
+			return false, fmt.Errorf("manifest file for service %s exists with a different type %s", o.name, svcType)
+		}
+	} else {
+		o.wkldType = svcType
+	}
+	log.Infof("Manifest file for service %s already exists. Skipping configuration.\n", o.name)
+	return true, nil
 }
 
 // isDfSelected indicates if any Dockerfile is in use.
@@ -471,7 +600,7 @@ func (o *initSvcOpts) askSvcPort() (err error) {
 		}
 	}
 	// Skip asking if it is a backend or worker service.
-	if o.wkldType == manifest.BackendServiceType || o.wkldType == manifest.WorkerServiceType {
+	if o.wkldType == manifestinfo.BackendServiceType || o.wkldType == manifestinfo.WorkerServiceType {
 		return nil
 	}
 
@@ -497,6 +626,21 @@ func (o *initSvcOpts) askSvcPort() (err error) {
 }
 
 func legitimizePlatform(engine dockerEngine, wkldType string) (manifest.PlatformString, error) {
+	if err := engine.CheckDockerEngineRunning(); err != nil {
+		// This is a best-effort attempt to detect the platform for users.
+		// If docker is not available, we skip this information.
+		var errDaemon *dockerengine.ErrDockerDaemonNotResponsive
+		switch {
+		case errors.Is(err, dockerengine.ErrDockerCommandNotFound):
+			log.Info("Docker command is not found; Copilot won't detect and populate the \"platform\" field in the manifest.\n")
+			return "", nil
+		case errors.As(err, &errDaemon):
+			log.Info("Docker daemon is not responsive; Copilot won't detect and populate the \"platform\" field in the manifest.\n")
+			return "", nil
+		default:
+			return "", fmt.Errorf("check if docker engine is running: %w", err)
+		}
+	}
 	detectedOs, detectedArch, err := engine.GetPlatform()
 	if err != nil {
 		return "", fmt.Errorf("get docker engine platform: %w", err)
@@ -509,12 +653,12 @@ func legitimizePlatform(engine dockerEngine, wkldType string) (manifest.Platform
 		return "", nil
 	}
 	// Return an error if a platform cannot be redirected.
-	if wkldType == manifest.RequestDrivenWebServiceType && detectedOs == manifest.OSWindows {
+	if wkldType == manifestinfo.RequestDrivenWebServiceType && detectedOs == manifest.OSWindows {
 		return "", manifest.ErrAppRunnerInvalidPlatformWindows
 	}
 	// Messages are logged only if the platform was redirected.
 	msg := fmt.Sprintf("Architecture type %s has been detected. We will set platform '%s' instead. If you'd rather build and run as architecture type %s, please change the 'platform' field in your workload manifest to '%s'.\n", detectedArch, redirectedPlatform, manifest.ArchARM64, dockerengine.PlatformString(detectedOs, manifest.ArchARM64))
-	if manifest.IsArmArch(detectedArch) && wkldType == manifest.RequestDrivenWebServiceType {
+	if manifest.IsArmArch(detectedArch) && wkldType == manifestinfo.RequestDrivenWebServiceType {
 		msg = fmt.Sprintf("Architecture type %s has been detected. At this time, %s architectures are not supported for App Runner workloads. We will set platform '%s' instead.\n", detectedArch, detectedArch, redirectedPlatform)
 	}
 	log.Warningf(msg)
@@ -522,7 +666,7 @@ func legitimizePlatform(engine dockerEngine, wkldType string) (manifest.Platform
 }
 
 func (o *initSvcOpts) askSvcPublishers() (err error) {
-	if o.wkldType != manifest.WorkerServiceType {
+	if o.wkldType != manifestinfo.WorkerServiceType {
 		return nil
 	}
 	// publishers already specified by flags
@@ -607,7 +751,7 @@ func parseHealthCheck(df dockerfileParser) (manifest.ContainerHealthCheck, error
 
 func svcTypePromptOpts() []prompt.Option {
 	var options []prompt.Option
-	for _, svcType := range manifest.ServiceTypes() {
+	for _, svcType := range manifestinfo.ServiceTypes() {
 		options = append(options, prompt.Option{
 			Value: svcType,
 			Hint:  serviceTypeHints[svcType],
@@ -659,6 +803,7 @@ This command is also run as part of "copilot init".`,
 	cmd.Flags().Uint16Var(&vars.port, svcPortFlag, 0, svcPortFlagDescription)
 	cmd.Flags().StringArrayVar(&vars.subscriptions, subscribeTopicsFlag, []string{}, subscribeTopicsFlagDescription)
 	cmd.Flags().BoolVar(&vars.noSubscribe, noSubscriptionFlag, false, noSubscriptionFlagDescription)
+	cmd.Flags().StringVar(&vars.ingressType, ingressTypeFlag, "", ingressTypeFlagDescription)
 
 	return cmd
 }

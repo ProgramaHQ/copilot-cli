@@ -28,6 +28,7 @@ Parameters:
       Default: "false"
     InstanceType:
       Type: 'AWS::SSM::Parameter::Value<String>'
+      Default: mini
 
 Mappings:
   MyTableDynamoDBSettings:
@@ -86,7 +87,7 @@ Resources:
           - Grants CRUD access to MyBucket
           - { Bucket: !Ref MyBucket }
         PolicyDocument:
-          Version: 2012-10-17
+          Version: '2012-10-17'
           Statement:
             - Sid: S3ObjectActions
               Effect: Allow

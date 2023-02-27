@@ -5,7 +5,6 @@ package cli
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -43,7 +42,7 @@ type packageJobOpts struct {
 	// Interfaces to interact with dependencies.
 	ws     wsJobDirReader
 	store  store
-	runner runner
+	runner execRunner
 	sel    wsSelector
 	prompt prompter
 
@@ -59,10 +58,10 @@ func newPackageJobOpts(vars packageJobVars) (*packageJobOpts, error) {
 		return nil, err
 	}
 	store := config.NewSSMStore(identity.New(defaultSess), ssm.New(defaultSess), aws.StringValue(defaultSess.Config.Region))
-
-	ws, err := workspace.New()
+	fs := afero.NewOsFs()
+	ws, err := workspace.Use(fs)
 	if err != nil {
-		return nil, fmt.Errorf("new workspace: %w", err)
+		return nil, err
 	}
 	prompter := prompt.New()
 	opts := &packageJobOpts{
@@ -70,7 +69,7 @@ func newPackageJobOpts(vars packageJobVars) (*packageJobOpts, error) {
 		ws:             ws,
 		store:          store,
 		runner:         exec.NewCmd(),
-		sel:            selector.NewWorkspaceSelect(prompter, store, ws),
+		sel:            selector.NewLocalWorkloadSelector(prompter, store, ws),
 		prompt:         prompter,
 	}
 
@@ -80,22 +79,22 @@ func newPackageJobOpts(vars packageJobVars) (*packageJobOpts, error) {
 				name:         o.name,
 				envName:      o.envName,
 				appName:      o.appName,
-				tag:          imageTagFromGit(o.runner, o.tag),
+				tag:          o.tag,
 				outputDir:    o.outputDir,
 				uploadAssets: o.uploadAssets,
 			},
-			runner:           o.runner,
-			initAddonsClient: initPackageAddonsClient,
-			ws:               ws,
-			store:            o.store,
-			stackWriter:      os.Stdout,
-			unmarshal:        manifest.UnmarshalWorkload,
-			newInterpolator:  newManifestInterpolator,
-			paramsWriter:     ioutil.Discard,
-			addonsWriter:     ioutil.Discard,
-			fs:               &afero.Afero{Fs: afero.NewOsFs()},
-			sessProvider:     sessProvider,
-			newTplGenerator:  newWkldTplGenerator,
+			runner:            o.runner,
+			ws:                ws,
+			store:             o.store,
+			templateWriter:    os.Stdout,
+			unmarshal:         manifest.UnmarshalWorkload,
+			newInterpolator:   newManifestInterpolator,
+			paramsWriter:      discardFile{},
+			addonsWriter:      discardFile{},
+			fs:                fs,
+			sessProvider:      sessProvider,
+			newStackGenerator: newWorkloadStackGenerator,
+			gitShortCommit:    imageTagFromGit(o.runner),
 		}
 	}
 	return opts, nil
@@ -140,6 +139,11 @@ func (o *packageJobOpts) Execute() error {
 	return o.packageCmd.Execute()
 }
 
+// RecommendActions suggests recommended actions before the packaged template is used for deployment.
+func (o *packageJobOpts) RecommendActions() error {
+	return o.packageCmd.RecommendActions()
+}
+
 func (o *packageJobOpts) askJobName() error {
 	if o.name != "" {
 		return nil
@@ -171,16 +175,18 @@ func buildJobPackageCmd() *cobra.Command {
 	vars := packageJobVars{}
 	cmd := &cobra.Command{
 		Use:   "package",
-		Short: "Prints the AWS CloudFormation template of a job.",
-		Long:  `Prints the CloudFormation template used to deploy a job to an environment.`,
+		Short: "Print the AWS CloudFormation template of a job.",
+		Long:  `Print the CloudFormation template used to deploy a job to an environment.`,
 		Example: `
   Print the CloudFormation template for the "report-generator" job parametrized for the "test" environment.
   /code $ copilot job package -n report-generator -e test
 
   Write the CloudFormation stack and configuration to a "infrastructure/" sub-directory instead of printing.
-  /code $ copilot job package -n report-generator -e test --output-dir ./infrastructure
-  /code $ ls ./infrastructure
-  /code report-generator-test.stack.yml      report-generator-test.params.yml`,
+  /startcodeblock
+  $ copilot job package -n report-generator -e test --output-dir ./infrastructure
+  $ ls ./infrastructure
+  report-generator-test.stack.yml      report-generator-test.params.yml
+  /endcodeblock`,
 		RunE: runCmdE(func(cmd *cobra.Command, args []string) error {
 			opts, err := newPackageJobOpts(vars)
 			if err != nil {

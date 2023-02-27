@@ -7,7 +7,10 @@ import (
 	"fmt"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/copilot-cli/internal/pkg/describe"
+	"github.com/spf13/afero"
 
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
 	"github.com/aws/copilot-cli/internal/pkg/exec"
@@ -30,22 +33,23 @@ import (
 type deployJobOpts struct {
 	deployWkldVars
 
-	store           store
-	ws              wsWlDirReader
-	unmarshal       func(in []byte) (manifest.WorkloadManifest, error)
-	newInterpolator func(app, env string) interpolator
-	cmd             runner
-	sessProvider    *sessions.Provider
-	envUpgradeCmd   actionCommand
-	newJobDeployer  func() (workloadDeployer, error)
-
-	sel wsSelector
+	store                store
+	ws                   wsWlDirReader
+	unmarshal            func(in []byte) (manifest.DynamicWorkload, error)
+	newInterpolator      func(app, env string) interpolator
+	cmd                  execRunner
+	sessProvider         *sessions.Provider
+	newJobDeployer       func() (workloadDeployer, error)
+	envFeaturesDescriber versionCompatibilityChecker
+	sel                  wsSelector
+	gitShortCommit       string
 
 	// cached variables
-	targetApp       *config.Application
-	targetEnv       *config.Environment
-	appliedManifest interface{}
-	rootUserARN     string
+	targetApp         *config.Application
+	targetEnv         *config.Environment
+	envSess           *session.Session
+	appliedDynamicMft manifest.DynamicWorkload
+	rootUserARN       string
 }
 
 func newJobDeployOpts(vars deployWkldVars) (*deployJobOpts, error) {
@@ -55,10 +59,9 @@ func newJobDeployOpts(vars deployWkldVars) (*deployJobOpts, error) {
 		return nil, err
 	}
 	store := config.NewSSMStore(identity.New(defaultSess), ssm.New(defaultSess), aws.StringValue(defaultSess.Config.Region))
-
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new workspace: %w", err)
+		return nil, err
 	}
 	prompter := prompt.New()
 	opts := &deployJobOpts{
@@ -67,7 +70,7 @@ func newJobDeployOpts(vars deployWkldVars) (*deployJobOpts, error) {
 		store:           store,
 		ws:              ws,
 		unmarshal:       manifest.UnmarshalWorkload,
-		sel:             selector.NewWorkspaceSelect(prompter, store, ws),
+		sel:             selector.NewLocalWorkloadSelector(prompter, store, ws),
 		sessProvider:    sessProvider,
 		newInterpolator: newManifestInterpolator,
 		cmd:             exec.NewCmd(),
@@ -80,17 +83,32 @@ func newJobDeployOpts(vars deployWkldVars) (*deployJobOpts, error) {
 }
 
 func newJobDeployer(o *deployJobOpts) (workloadDeployer, error) {
-	var err error
-	var deployer workloadDeployer
+	raw, err := o.ws.ReadWorkloadManifest(o.name)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest file for %s: %w", o.name, err)
+	}
+	ovrdr, err := deploy.NewOverrider(o.ws.WorkloadOverridesPath(o.name), o.appName, o.envName, afero.NewOsFs(), o.sessProvider)
+	if err != nil {
+		return nil, err
+	}
+
+	content := o.appliedDynamicMft.Manifest()
 	in := deploy.WorkloadDeployerInput{
 		SessionProvider: o.sessProvider,
 		Name:            o.name,
 		App:             o.targetApp,
 		Env:             o.targetEnv,
-		ImageTag:        o.imageTag,
-		Mft:             o.appliedManifest,
+		Image: deploy.ContainerImageIdentifier{
+			CustomTag:         o.imageTag,
+			GitShortCommitTag: o.gitShortCommit,
+		},
+		Mft:              content,
+		RawMft:           raw,
+		EnvVersionGetter: o.envFeaturesDescriber,
+		Overrider:        ovrdr,
 	}
-	switch t := o.appliedManifest.(type) {
+	var deployer workloadDeployer
+	switch t := content.(type) {
 	case *manifest.ScheduledJob:
 		deployer, err = deploy.NewJobDeployer(&in)
 	default:
@@ -138,9 +156,6 @@ func (o *deployJobOpts) Execute() error {
 			return err
 		}
 	}
-	if err := o.envUpgradeCmd.Execute(); err != nil {
-		return fmt.Errorf(`execute "env upgrade --app %s --name %s": %v`, o.appName, o.envName, err)
-	}
 	mft, err := workloadManifest(&workloadManifestInput{
 		name:         o.name,
 		appName:      o.appName,
@@ -148,11 +163,15 @@ func (o *deployJobOpts) Execute() error {
 		interpolator: o.newInterpolator(o.appName, o.envName),
 		ws:           o.ws,
 		unmarshal:    o.unmarshal,
+		sess:         o.envSess,
 	})
 	if err != nil {
 		return err
 	}
-	o.appliedManifest = mft
+	o.appliedDynamicMft = mft
+	if err := validateWorkloadManifestCompatibilityWithEnv(o.ws, o.envFeaturesDescriber, mft, o.envName); err != nil {
+		return err
+	}
 	deployer, err := o.newJobDeployer()
 	if err != nil {
 		return err
@@ -172,11 +191,12 @@ func (o *deployJobOpts) Execute() error {
 	}
 	if _, err = deployer.DeployWorkload(&deploy.DeployWorkloadInput{
 		StackRuntimeConfiguration: deploy.StackRuntimeConfiguration{
-			ImageDigest: uploadOut.ImageDigest,
-			EnvFileARN:  uploadOut.EnvFileARN,
-			AddonsURL:   uploadOut.AddonsURL,
-			RootUserARN: o.rootUserARN,
-			Tags:        tags.Merge(o.targetApp.Tags, o.resourceTags),
+			ImageDigests:       uploadOut.ImageDigests,
+			EnvFileARN:         uploadOut.EnvFileARN,
+			AddonsURL:          uploadOut.AddonsURL,
+			RootUserARN:        o.rootUserARN,
+			Tags:               tags.Merge(o.targetApp.Tags, o.resourceTags),
+			CustomResourceURLs: uploadOut.CustomResourceURLs,
 		},
 		Options: deploy.Options{
 			DisableRollback: o.disableRollback,
@@ -198,7 +218,7 @@ After fixing the deployment, you can:
 }
 
 func (o *deployJobOpts) configureClients() error {
-	o.imageTag = imageTagFromGit(o.cmd, o.imageTag) // Best effort assign git tag.
+	o.gitShortCommit = imageTagFromGit(o.cmd) // Best effort assign git tag.
 	env, err := o.store.GetEnvironment(o.appName, o.envName)
 	if err != nil {
 		return err
@@ -215,15 +235,11 @@ func (o *deployJobOpts) configureClients() error {
 	if err != nil {
 		return fmt.Errorf("create default session: %w", err)
 	}
-
-	cmd, err := newEnvUpgradeOpts(envUpgradeVars{
-		appName: o.appName,
-		name:    env.Name,
-	})
+	envSess, err := o.sessProvider.FromRole(env.ManagerRoleARN, env.Region)
 	if err != nil {
-		return fmt.Errorf("new env upgrade command: %v", err)
+		return err
 	}
-	o.envUpgradeCmd = cmd
+	o.envSess = envSess
 
 	// client to retrieve caller identity.
 	caller, err := identity.New(defaultSess).Get()
@@ -232,6 +248,15 @@ func (o *deployJobOpts) configureClients() error {
 	}
 	o.rootUserARN = caller.RootUserARN
 
+	envDescriber, err := describe.NewEnvDescriber(describe.NewEnvDescriberConfig{
+		App:         o.appName,
+		Env:         o.envName,
+		ConfigStore: o.store,
+	})
+	if err != nil {
+		return err
+	}
+	o.envFeaturesDescriber = envDescriber
 	return nil
 }
 

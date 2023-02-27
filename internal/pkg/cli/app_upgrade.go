@@ -5,6 +5,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
@@ -69,9 +70,9 @@ func newAppUpgradeOpts(vars appUpgradeVars) (*appUpgradeOpts, error) {
 		identity:       identity.New(sess),
 		prog:           termprogress.NewSpinner(log.DiagnosticWriter),
 		route53:        route53.New(sess),
-		sel:            selector.NewSelect(prompt.New(), store),
+		sel:            selector.NewAppEnvSelector(prompt.New(), store),
 		versionGetter:  d,
-		upgrader:       cloudformation.New(sess),
+		upgrader:       cloudformation.New(sess, cloudformation.WithProgressTracker(os.Stderr)),
 	}, nil
 }
 

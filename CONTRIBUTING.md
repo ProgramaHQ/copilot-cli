@@ -20,7 +20,7 @@ Please read it over and let us know if it's not up-to-date (or, even better, sub
 
 ### Environment
 
-- Make sure you are using Go 1.17 (`go version`).
+- Make sure you are using Go 1.20 (`go version`).
 - Fork the repository.
 - Clone your forked repository locally.
 - We use Go Modules to manage dependencies, so you can develop outside of your $GOPATH.
@@ -53,7 +53,8 @@ Each e2e profile needs to be configured for a different AWS account and a differ
 Below are the different commands which can be run in the root of the project directory.
 
 * Run `make` (This creates a standalone executable in the `bin/local` directory).
-* Run `make test` to run the unit tests.
+* Run `make run-unit-test` to run only Go unit tests.
+* Run `make test` to run Go and Node.js unit tests. You'll need Node.js and npm for these tests to run.
 * Run `make integ-test` to run integration tests against your Default AWS profile. **Warning** - this will create AWS resources in your `default` profile.
 * Run `make e2e` to run end to end tests (tests that run commands locally). **Warning** - this will create AWS resources in your account. You'll need Docker running for these tests to run.
 
@@ -96,6 +97,9 @@ more easily and increases the chances that your feature request will be accepted
 * All submissions, including submissions by project members, require review. We
 use GitHub pull requests for this purpose. Consult GitHub Help for more
 information on using pull requests.
+
+* If you choose to submit a GitHub pull request, make sure its name conforms to
+the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) standard!
 
 ## Amazon Open Source Code of Conduct
 

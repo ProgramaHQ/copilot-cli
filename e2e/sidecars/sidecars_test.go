@@ -6,14 +6,13 @@ package sidecars_test
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"os"
 	"strings"
 
 	"github.com/aws/copilot-cli/e2e/internal/client"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -66,7 +65,7 @@ logging:
 const nginxPort = "80"
 
 var _ = Describe("sidecars flow", func() {
-	Context("when creating a new app", func() {
+	Context("when creating a new app", Ordered, func() {
 		var (
 			initErr error
 		)
@@ -96,7 +95,7 @@ var _ = Describe("sidecars flow", func() {
 		})
 	})
 
-	Context("when creating a new environment", func() {
+	Context("when adding a new environment", Ordered, func() {
 		var (
 			testEnvInitErr error
 		)
@@ -105,7 +104,6 @@ var _ = Describe("sidecars flow", func() {
 				AppName: appName,
 				EnvName: "test",
 				Profile: "default",
-				Prod:    false,
 			})
 		})
 
@@ -114,7 +112,21 @@ var _ = Describe("sidecars flow", func() {
 		})
 	})
 
-	Context("when creating a service", func() {
+	Context("when deploying the environment", Ordered, func() {
+		var envDeployErr error
+		BeforeAll(func() {
+			_, envDeployErr = cli.EnvDeploy(&client.EnvDeployRequest{
+				AppName: appName,
+				Name:    "test",
+			})
+		})
+
+		It("should succeed", func() {
+			Expect(envDeployErr).NotTo(HaveOccurred())
+		})
+	})
+
+	Context("when creating a service", Ordered, func() {
 		var (
 			svcInitErr error
 		)
@@ -179,32 +191,34 @@ var _ = Describe("sidecars flow", func() {
 		It("overwrite existing manifest", func() {
 			logGroupName := fmt.Sprintf("%s-test-%s", appName, svcName)
 			newManifest = fmt.Sprintf(manifest, sidecarImageURI, nginxPort, logGroupName)
-			err := ioutil.WriteFile("./copilot/hello/manifest.yml", []byte(newManifest), 0644)
+			err := os.WriteFile("./copilot/hello/manifest.yml", []byte(newManifest), 0644)
 			Expect(err).NotTo(HaveOccurred(), "overwrite manifest")
 		})
 		It("add addons folder for Firelens permissions", func() {
 			err := os.MkdirAll("./copilot/hello/addons", 0777)
 			Expect(err).NotTo(HaveOccurred(), "create addons dir")
 
-			fds, err := ioutil.ReadDir("./hello/addons")
+			fds, err := os.ReadDir("./hello/addons")
 			Expect(err).NotTo(HaveOccurred(), "read addons dir")
 
 			for _, fd := range fds {
-				destFile, err := os.Create(fmt.Sprintf("./copilot/hello/addons/%s", fd.Name()))
-				Expect(err).NotTo(HaveOccurred(), "create destination file")
-				defer destFile.Close()
+				func() {
+					destFile, err := os.Create(fmt.Sprintf("./copilot/hello/addons/%s", fd.Name()))
+					Expect(err).NotTo(HaveOccurred(), "create destination file")
+					defer destFile.Close()
 
-				srcFile, err := os.Open(fmt.Sprintf("./hello/addons/%s", fd.Name()))
-				Expect(err).NotTo(HaveOccurred(), "open source file")
-				defer srcFile.Close()
+					srcFile, err := os.Open(fmt.Sprintf("./hello/addons/%s", fd.Name()))
+					Expect(err).NotTo(HaveOccurred(), "open source file")
+					defer srcFile.Close()
 
-				_, err = io.Copy(destFile, srcFile)
-				Expect(err).NotTo(HaveOccurred(), "copy file")
+					_, err = io.Copy(destFile, srcFile)
+					Expect(err).NotTo(HaveOccurred(), "copy file")
+				}()
 			}
 		})
 	})
 
-	Context("when deploying svc", func() {
+	Context("when deploying svc", Ordered, func() {
 		var (
 			appDeployErr error
 		)
@@ -243,7 +257,7 @@ var _ = Describe("sidecars flow", func() {
 
 			// Read the response - our deployed apps should return a body with their
 			// name as the value.
-			bodyBytes, err := ioutil.ReadAll(resp.Body)
+			bodyBytes, err := io.ReadAll(resp.Body)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(string(bodyBytes)).To(Equal("Ready"))
 		})

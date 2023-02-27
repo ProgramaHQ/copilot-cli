@@ -4,12 +4,10 @@
 package s3
 
 import (
-	"archive/zip"
 	"bytes"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -21,76 +19,6 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 )
-
-func TestS3_ZipAndUpload(t *testing.T) {
-	testCases := map[string]struct {
-		mockS3ManagerClient func(m *mocks.Mocks3ManagerAPI)
-
-		wantedURL string
-		wantError error
-	}{
-		"return error if upload fails": {
-			mockS3ManagerClient: func(m *mocks.Mocks3ManagerAPI) {
-				m.EXPECT().Upload(gomock.Any()).Do(func(in *s3manager.UploadInput, _ ...func(*s3manager.Uploader)) {
-					require.Equal(t, aws.StringValue(in.Bucket), "mockBucket")
-					require.Equal(t, aws.StringValue(in.Key), "mockFileName")
-				}).Return(nil, errors.New("some error"))
-			},
-			wantError: fmt.Errorf("upload mockFileName to bucket mockBucket: some error"),
-		},
-		"should upload to the s3 bucket": {
-			mockS3ManagerClient: func(m *mocks.Mocks3ManagerAPI) {
-				m.EXPECT().Upload(gomock.Any()).Do(func(in *s3manager.UploadInput, _ ...func(*s3manager.Uploader)) {
-					b, err := ioutil.ReadAll(in.Body)
-					require.NoError(t, err)
-					reader, err := zip.NewReader(bytes.NewReader(b), int64(len(b)))
-					require.NoError(t, err)
-					for _, f := range reader.File {
-						require.Equal(t, f.Name, "foo")
-						rc, err := f.Open()
-						require.NoError(t, err)
-						buf := &bytes.Buffer{}
-						_, err = io.CopyN(buf, rc, 3)
-						require.NoError(t, err)
-						require.Equal(t, buf.String(), "bar")
-						rc.Close()
-						fmt.Println()
-					}
-					require.Equal(t, aws.StringValue(in.Bucket), "mockBucket")
-					require.Equal(t, aws.StringValue(in.Key), "mockFileName")
-				}).Return(&s3manager.UploadOutput{
-					Location: "mockURL",
-				}, nil)
-			},
-			wantedURL: "mockURL",
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// GIVEN
-			ctrl := gomock.NewController(t)
-			defer ctrl.Finish()
-
-			mockS3ManagerClient := mocks.NewMocks3ManagerAPI(ctrl)
-			tc.mockS3ManagerClient(mockS3ManagerClient)
-
-			service := S3{
-				s3Manager: mockS3ManagerClient,
-			}
-
-			gotURL, gotErr := service.ZipAndUpload("mockBucket", "mockFileName", namedBinary{})
-
-			if gotErr != nil {
-				require.EqualError(t, gotErr, tc.wantError.Error())
-			} else {
-				require.Equal(t, gotErr, nil)
-				require.Equal(t, gotURL, tc.wantedURL)
-			}
-		})
-
-	}
-}
 
 func TestS3_Upload(t *testing.T) {
 	testCases := map[string]struct {
@@ -111,11 +39,12 @@ func TestS3_Upload(t *testing.T) {
 		"should upload to the s3 bucket": {
 			mockS3ManagerClient: func(m *mocks.Mocks3ManagerAPI) {
 				m.EXPECT().Upload(gomock.Any()).Do(func(in *s3manager.UploadInput, _ ...func(*s3manager.Uploader)) {
-					b, err := ioutil.ReadAll(in.Body)
+					b, err := io.ReadAll(in.Body)
 					require.NoError(t, err)
 					require.Equal(t, "bar", string(b))
 					require.Equal(t, "mockBucket", aws.StringValue(in.Bucket))
 					require.Equal(t, "mockFileName", aws.StringValue(in.Key))
+					require.Equal(t, s3.ObjectCannedACLBucketOwnerFullControl, aws.StringValue(in.ACL))
 				}).Return(&s3manager.UploadOutput{
 					Location: "mockURL",
 				}, nil)
@@ -148,12 +77,6 @@ func TestS3_Upload(t *testing.T) {
 		})
 	}
 }
-
-type namedBinary struct{}
-
-func (n namedBinary) Name() string { return "foo" }
-
-func (n namedBinary) Content() []byte { return []byte("bar") }
 
 func TestS3_EmptyBucket(t *testing.T) {
 	batchObject1 := make([]*s3.ObjectVersion, 1000)
@@ -332,7 +255,7 @@ func TestS3_EmptyBucket(t *testing.T) {
 			mockS3Client: func(m *mocks.Mocks3API) {
 				m.EXPECT().HeadBucket(&s3.HeadBucketInput{
 					Bucket: aws.String("mockBucket"),
-				}).Return(nil, awserr.New(notFound, "message", nil))
+				}).Return(nil, awserr.New(errCodeNotFound, "message", nil))
 			},
 
 			wantErr: nil,
@@ -385,9 +308,28 @@ func TestS3_ParseURL(t *testing.T) {
 			inURL:     "badURL",
 			wantError: fmt.Errorf("cannot parse S3 URL badURL into bucket name and key"),
 		},
-		"success": {
+		"return error S3 URI": {
+			inURL:     "s3://",
+			wantError: fmt.Errorf("cannot parse S3 URI s3:// into bucket name and key"),
+		},
+		"parses S3 URI": {
+			inURL:            "s3://amplify-demo-dev-94628-deployment/auth/amplify-meta.json",
+			wantedBucketName: "amplify-demo-dev-94628-deployment",
+			wantedKey:        "auth/amplify-meta.json",
+		},
+		"parses object URL": {
 			inURL:            "https://stackset-myapp-infrastru-pipelinebuiltartifactbuc-1nk5t9zkymh8r.s3-us-west-2.amazonaws.com/scripts/dns-cert-validator/dd2278811c3",
 			wantedBucketName: "stackset-myapp-infrastru-pipelinebuiltartifactbuc-1nk5t9zkymh8r",
+			wantedKey:        "scripts/dns-cert-validator/dd2278811c3",
+		},
+		"parses object URL with dots": {
+			inURL:            "https://bucket.with.dots.in.name.s3.us-west-2.amazonaws.com/scripts/dns-cert-validator/dd2278811c3",
+			wantedBucketName: "bucket.with.dots.in.name",
+			wantedKey:        "scripts/dns-cert-validator/dd2278811c3",
+		},
+		"parses legacy object URL with dots": {
+			inURL:            "https://bucket.with.dots.in.name.s3-us-west-2.amazonaws.com/scripts/dns-cert-validator/dd2278811c3",
+			wantedBucketName: "bucket.with.dots.in.name",
 			wantedKey:        "scripts/dns-cert-validator/dd2278811c3",
 		},
 	}
@@ -400,9 +342,77 @@ func TestS3_ParseURL(t *testing.T) {
 				require.EqualError(t, gotErr, tc.wantError.Error())
 			} else {
 				require.Equal(t, gotErr, nil)
-				require.Equal(t, gotBucketName, tc.wantedBucketName)
-				require.Equal(t, gotKey, tc.wantedKey)
+				require.Equal(t, tc.wantedBucketName, gotBucketName)
+				require.Equal(t, tc.wantedKey, gotKey)
 			}
+		})
+	}
+}
+
+func Test_ParseARN(t *testing.T) {
+	type wanted struct {
+		bucket string
+		key    string
+		err    error
+	}
+	testCases := map[string]struct {
+		in     string
+		wanted wanted
+	}{
+		"bad bad arn": {
+			in:     "i am not an arn at all",
+			wanted: wanted{err: errors.New("invalid S3 ARN")},
+		},
+		"parses an S3 bucket arn": {
+			in:     "arn:aws:s3:::amplify-demo-dev-94628-deployment",
+			wanted: wanted{bucket: "amplify-demo-dev-94628-deployment"},
+		},
+		"parses an S3 object arn": {
+			in:     "arn:aws:s3:::amplify-demo-dev-94628-deployment/studio-backend/auth/demo6a968da2/build/parameters.json",
+			wanted: wanted{bucket: "amplify-demo-dev-94628-deployment", key: "studio-backend/auth/demo6a968da2/build/parameters.json"},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			bucket, key, err := ParseARN(tc.in)
+			if tc.wanted.err != nil {
+				require.ErrorContains(t, err, tc.wanted.err.Error())
+				return
+			}
+			require.Equal(t, tc.wanted.bucket, bucket)
+			require.Equal(t, tc.wanted.key, key)
+		})
+	}
+}
+
+func TestURL(t *testing.T) {
+	testCases := map[string]struct {
+		region string
+		bucket string
+		key    string
+
+		wanted string
+	}{
+		// See https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-bucket-intro.html#virtual-host-style-url-ex
+		"Formats a virtual-hosted-style URL": {
+			region: "us-west-2",
+			bucket: "mybucket",
+			key:    "puppy.jpg",
+
+			wanted: "https://mybucket.s3.us-west-2.amazonaws.com/puppy.jpg",
+		},
+		"Formats the URL for a region in the aws-cn partition": {
+			region: "cn-north-1",
+			bucket: "mybucket",
+			key:    "puppy.jpg",
+
+			wanted: "https://mybucket.s3.cn-north-1.amazonaws.cn/puppy.jpg",
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tc.wanted, URL(tc.region, tc.bucket, tc.key))
 		})
 	}
 }

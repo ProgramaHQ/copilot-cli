@@ -7,12 +7,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/aws/copilot-cli/internal/pkg/docker/dockerengine"
 	"text/tabwriter"
+
+	"github.com/aws/copilot-cli/internal/pkg/docker/dockerengine"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 
 	cfnstack "github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
 	"github.com/aws/copilot-cli/internal/pkg/describe/stack"
-	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 )
 
@@ -23,7 +24,7 @@ type WorkerServiceDescriber struct {
 	enableResources bool
 
 	store             DeployedEnvServicesLister
-	initClients       func(string) error
+	initECSDescriber  func(string) (ecsDescriber, error)
 	svcStackDescriber map[string]ecsDescriber
 }
 
@@ -37,21 +38,20 @@ func NewWorkerServiceDescriber(opt NewServiceConfig) (*WorkerServiceDescriber, e
 
 		svcStackDescriber: make(map[string]ecsDescriber),
 	}
-	describer.initClients = func(env string) error {
-		if _, ok := describer.svcStackDescriber[env]; ok {
-			return nil
+	describer.initECSDescriber = func(env string) (ecsDescriber, error) {
+		if describer, ok := describer.svcStackDescriber[env]; ok {
+			return describer, nil
 		}
-		d, err := NewECSServiceDescriber(NewServiceConfig{
+		d, err := newECSServiceDescriber(NewServiceConfig{
 			App:         opt.App,
-			Env:         env,
 			Svc:         opt.Svc,
 			ConfigStore: opt.ConfigStore,
-		})
+		}, env)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		describer.svcStackDescriber[env] = d
-		return nil
+		return d, nil
 	}
 	return describer, nil
 }
@@ -66,16 +66,17 @@ func (d *WorkerServiceDescriber) Describe() (HumanJSONStringer, error) {
 	var configs []*ECSServiceConfig
 	var envVars []*containerEnvVar
 	var secrets []*secret
+	var alarms  []string
 	for _, env := range environments {
-		err := d.initClients(env)
+		svcDescr, err := d.initECSDescriber(env)
 		if err != nil {
 			return nil, err
 		}
-		svcParams, err := d.svcStackDescriber[env].Params()
+		svcParams, err := svcDescr.Params()
 		if err != nil {
 			return nil, fmt.Errorf("get stack parameters for environment %s: %w", env, err)
 		}
-		containerPlatform, err := d.svcStackDescriber[env].Platform()
+		containerPlatform, err := svcDescr.Platform()
 		if err != nil {
 			return nil, fmt.Errorf("retrieve platform: %w", err)
 		}
@@ -89,12 +90,16 @@ func (d *WorkerServiceDescriber) Describe() (HumanJSONStringer, error) {
 			},
 			Tasks: svcParams[cfnstack.WorkloadTaskCountParamKey],
 		})
-		workerSvcEnvVars, err := d.svcStackDescriber[env].EnvVars()
+		alarms, err = svcDescr.RollbackAlarmNames()
+		if err != nil {
+			return nil, fmt.Errorf("retrieve rollback alarm names: %w", err)
+		}
+		workerSvcEnvVars, err := svcDescr.EnvVars()
 		if err != nil {
 			return nil, fmt.Errorf("retrieve environment variables: %w", err)
 		}
 		envVars = append(envVars, flattenContainerEnvVars(env, workerSvcEnvVars)...)
-		webSvcSecrets, err := d.svcStackDescriber[env].Secrets()
+		webSvcSecrets, err := svcDescr.Secrets()
 		if err != nil {
 			return nil, fmt.Errorf("retrieve secrets: %w", err)
 		}
@@ -104,11 +109,11 @@ func (d *WorkerServiceDescriber) Describe() (HumanJSONStringer, error) {
 	resources := make(map[string][]*stack.Resource)
 	if d.enableResources {
 		for _, env := range environments {
-			err := d.initClients(env)
+			svcDescr, err := d.initECSDescriber(env)
 			if err != nil {
 				return nil, err
 			}
-			stackResources, err := d.svcStackDescriber[env].ServiceStackResources()
+			stackResources, err := svcDescr.ServiceStackResources()
 			if err != nil {
 				return nil, fmt.Errorf("retrieve service resources: %w", err)
 			}
@@ -118,9 +123,10 @@ func (d *WorkerServiceDescriber) Describe() (HumanJSONStringer, error) {
 
 	return &workerSvcDesc{
 		Service:        d.svc,
-		Type:           manifest.WorkerServiceType,
+		Type:           manifestinfo.WorkerServiceType,
 		App:            d.app,
 		Configurations: configs,
+		Alarms:         alarms,
 		Variables:      envVars,
 		Secrets:        secrets,
 		Resources:      resources,
@@ -129,12 +135,23 @@ func (d *WorkerServiceDescriber) Describe() (HumanJSONStringer, error) {
 	}, nil
 }
 
+// Manifest returns the contents of the manifest used to deploy a worker service stack.
+// If the Manifest metadata doesn't exist in the stack template, then returns ErrManifestNotFoundInTemplate.
+func (d *WorkerServiceDescriber) Manifest(env string) ([]byte, error) {
+	cfn, err := d.initECSDescriber(env)
+	if err != nil {
+		return nil, err
+	}
+	return cfn.Manifest()
+}
+
 // workerSvcDesc contains serialized parameters for a worker service.
 type workerSvcDesc struct {
 	Service        string               `json:"service"`
 	Type           string               `json:"type"`
 	App            string               `json:"application"`
 	Configurations ecsConfigurations    `json:"configurations"`
+	Alarms         []string             `json:"rollbackAlarms,omitempty"`
 	Variables      containerEnvVars     `json:"variables"`
 	Secrets        secrets              `json:"secrets,omitempty"`
 	Resources      deployedSvcResources `json:"resources,omitempty"`
@@ -163,6 +180,11 @@ func (w *workerSvcDesc) HumanString() string {
 	fmt.Fprint(writer, color.Bold.Sprint("\nConfigurations\n\n"))
 	writer.Flush()
 	w.Configurations.humanString(writer)
+	if len(w.Alarms) > 0 {
+		fmt.Fprint(writer, color.Bold.Sprint("\nRollback Alarms\n\n"))
+		writer.Flush()
+		rollbackAlarms(w.Alarms).humanString(writer)
+	}
 	fmt.Fprint(writer, color.Bold.Sprint("\nVariables\n\n"))
 	writer.Flush()
 	w.Variables.humanString(writer)

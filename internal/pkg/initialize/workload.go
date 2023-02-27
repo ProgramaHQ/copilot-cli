@@ -14,15 +14,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	"github.com/aws/copilot-cli/internal/pkg/workspace"
-)
-
-const (
-	fmtAddWlToAppStart    = "Creating ECR repositories for %s %s."
-	fmtAddWlToAppFailed   = "Failed to create ECR repositories for %s %s.\n\n"
-	fmtAddWlToAppComplete = "Created ECR repositories for %s %s.\n\n"
 )
 
 const (
@@ -53,7 +48,7 @@ type WorkloadAdder interface {
 
 // Workspace contains the methods needed to manipulate a Copilot workspace.
 type Workspace interface {
-	Path() (string, error)
+	Rel(path string) (string, error)
 	WriteJobManifest(marshaler encoding.BinaryMarshaler, jobName string) (string, error)
 	WriteServiceManifest(marshaler encoding.BinaryMarshaler, serviceName string) (string, error)
 }
@@ -66,13 +61,15 @@ type Prog interface {
 
 // WorkloadProps contains the information needed to represent a Workload (job or service).
 type WorkloadProps struct {
-	App            string
-	Type           string
-	Name           string
-	DockerfilePath string
-	Image          string
-	Platform       manifest.PlatformArgsOrString
-	Topics         []manifest.TopicSubscription
+	App                     string
+	Type                    string
+	Name                    string
+	DockerfilePath          string
+	Image                   string
+	Platform                manifest.PlatformArgsOrString
+	Topics                  []manifest.TopicSubscription
+	Queue                   manifest.SQSQueue
+	PrivateOnlyEnvironments []string
 }
 
 // JobProps contains the information needed to represent a Job.
@@ -89,6 +86,7 @@ type ServiceProps struct {
 	WorkloadProps
 	Port        uint16
 	HealthCheck manifest.ContainerHealthCheck
+	Private     bool
 	appDomain   *string
 }
 
@@ -135,7 +133,7 @@ func (w *WorkloadInitializer) addWlToStore(wl *config.Workload, wlType string) e
 
 func (w *WorkloadInitializer) initJob(props *JobProps) (string, error) {
 	if props.DockerfilePath != "" {
-		path, err := relativeDockerfilePath(w.Ws, props.DockerfilePath)
+		path, err := w.Ws.Rel(props.DockerfilePath)
 		if err != nil {
 			return "", err
 		}
@@ -156,15 +154,13 @@ func (w *WorkloadInitializer) initJob(props *JobProps) (string, error) {
 		manifestExists = true
 		manifestPath = e.FileName
 	}
-	manifestPath, err = relPath(manifestPath)
-	if err != nil {
-		return "", err
-	}
 	manifestMsgFmt := "Wrote the manifest for %s %s at %s\n"
 	if manifestExists {
 		manifestMsgFmt = "Manifest file for %s %s already exists at %s, skipping writing it.\n"
 	}
-	log.Successf(manifestMsgFmt, jobWlType, color.HighlightUserInput(props.Name), color.HighlightResource(manifestPath))
+
+	path := displayPath(manifestPath)
+	log.Successf(manifestMsgFmt, jobWlType, color.HighlightUserInput(props.Name), color.HighlightResource(path))
 	var sched = props.Schedule
 	if props.Schedule == "" {
 		sched = "None"
@@ -182,12 +178,17 @@ func (w *WorkloadInitializer) initJob(props *JobProps) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return manifestPath, nil
+
+	path, err = w.Ws.Rel(manifestPath)
+	if err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func (w *WorkloadInitializer) initService(props *ServiceProps) (string, error) {
 	if props.DockerfilePath != "" {
-		path, err := relativeDockerfilePath(w.Ws, props.DockerfilePath)
+		path, err := w.Ws.Rel(props.DockerfilePath)
 		if err != nil {
 			return "", err
 		}
@@ -215,15 +216,14 @@ func (w *WorkloadInitializer) initService(props *ServiceProps) (string, error) {
 		manifestExists = true
 		manifestPath = e.FileName
 	}
-	manifestPath, err = relPath(manifestPath)
-	if err != nil {
-		return "", err
-	}
+
 	manifestMsgFmt := "Wrote the manifest for %s %s at %s\n"
 	if manifestExists {
 		manifestMsgFmt = "Manifest file for %s %s already exists at %s, skipping writing it.\n"
 	}
-	log.Successf(manifestMsgFmt, svcWlType, color.HighlightUserInput(props.Name), color.HighlightResource(manifestPath))
+
+	path := displayPath(manifestPath)
+	log.Successf(manifestMsgFmt, svcWlType, color.HighlightUserInput(props.Name), color.HighlightResource(path))
 
 	helpText := "Your manifest contains configurations like your container size and port."
 	if props.Port != 0 {
@@ -236,7 +236,12 @@ func (w *WorkloadInitializer) initService(props *ServiceProps) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return manifestPath, nil
+
+	path, err = w.Ws.Rel(manifestPath)
+	if err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func (w *WorkloadInitializer) addSvcToAppAndSSM(app *config.Application, props WorkloadProps) error {
@@ -248,12 +253,9 @@ func (w *WorkloadInitializer) addJobToAppAndSSM(app *config.Application, props W
 }
 
 func (w *WorkloadInitializer) addWlToAppAndSSM(app *config.Application, props WorkloadProps, wlType string) error {
-	w.Prog.Start(fmt.Sprintf(fmtAddWlToAppStart, wlType, props.Name))
 	if err := w.addWlToApp(app, props.Name, wlType); err != nil {
-		w.Prog.Stop(log.Serrorf(fmtAddWlToAppFailed, wlType, props.Name))
 		return fmt.Errorf("add %s %s to application %s: %w", wlType, props.Name, props.App, err)
 	}
-	w.Prog.Stop(log.Ssuccessf(fmtAddWlToAppComplete, wlType, props.Name))
 
 	if err := w.addWlToStore(&config.Workload{
 		App:  props.App,
@@ -268,12 +270,13 @@ func (w *WorkloadInitializer) addWlToAppAndSSM(app *config.Application, props Wo
 
 func newJobManifest(i *JobProps) (encoding.BinaryMarshaler, error) {
 	switch i.Type {
-	case manifest.ScheduledJobType:
+	case manifestinfo.ScheduledJobType:
 		return manifest.NewScheduledJob(&manifest.ScheduledJobProps{
 			WorkloadProps: &manifest.WorkloadProps{
-				Name:       i.Name,
-				Dockerfile: i.DockerfilePath,
-				Image:      i.Image,
+				Name:                    i.Name,
+				Dockerfile:              i.DockerfilePath,
+				Image:                   i.Image,
+				PrivateOnlyEnvironments: i.PrivateOnlyEnvironments,
 			},
 			HealthCheck: i.HealthCheck,
 			Platform:    i.Platform,
@@ -289,14 +292,16 @@ func newJobManifest(i *JobProps) (encoding.BinaryMarshaler, error) {
 
 func (w *WorkloadInitializer) newServiceManifest(i *ServiceProps) (encoding.BinaryMarshaler, error) {
 	switch i.Type {
-	case manifest.LoadBalancedWebServiceType:
+	case manifestinfo.LoadBalancedWebServiceType:
 		return w.newLoadBalancedWebServiceManifest(i)
-	case manifest.RequestDrivenWebServiceType:
+	case manifestinfo.RequestDrivenWebServiceType:
 		return w.newRequestDrivenWebServiceManifest(i), nil
-	case manifest.BackendServiceType:
+	case manifestinfo.BackendServiceType:
 		return newBackendServiceManifest(i)
-	case manifest.WorkerServiceType:
+	case manifestinfo.WorkerServiceType:
 		return newWorkerServiceManifest(i)
+	case manifestinfo.StaticSiteType:
+		return manifest.NewStaticSite(i.Name), nil
 	default:
 		return nil, fmt.Errorf("service type %s doesn't have a manifest", i.Type)
 	}
@@ -311,9 +316,10 @@ func (w *WorkloadInitializer) newLoadBalancedWebServiceManifest(i *ServiceProps)
 	}
 	props := &manifest.LoadBalancedWebServiceProps{
 		WorkloadProps: &manifest.WorkloadProps{
-			Name:       i.Name,
-			Dockerfile: i.DockerfilePath,
-			Image:      i.Image,
+			Name:                    i.Name,
+			Dockerfile:              i.DockerfilePath,
+			Image:                   i.Image,
+			PrivateOnlyEnvironments: i.PrivateOnlyEnvironments,
 		},
 		Path:        "/",
 		Port:        i.Port,
@@ -328,7 +334,7 @@ func (w *WorkloadInitializer) newLoadBalancedWebServiceManifest(i *ServiceProps)
 	// We default to "/" for the first service, but if there's another
 	// Load Balanced Web Service, we use the svc name as the default, instead.
 	for _, existingSvc := range existingSvcs {
-		if existingSvc.Type == manifest.LoadBalancedWebServiceType && existingSvc.Name != i.Name {
+		if existingSvc.Type == manifestinfo.LoadBalancedWebServiceType && existingSvc.Name != i.Name {
 			props.Path = i.Name
 			break
 		}
@@ -345,6 +351,7 @@ func (w *WorkloadInitializer) newRequestDrivenWebServiceManifest(i *ServiceProps
 		},
 		Port:     i.Port,
 		Platform: i.Platform,
+		Private:  i.Private,
 	}
 	return manifest.NewRequestDrivenWebService(props)
 }
@@ -352,9 +359,10 @@ func (w *WorkloadInitializer) newRequestDrivenWebServiceManifest(i *ServiceProps
 func newBackendServiceManifest(i *ServiceProps) (*manifest.BackendService, error) {
 	return manifest.NewBackendService(manifest.BackendServiceProps{
 		WorkloadProps: manifest.WorkloadProps{
-			Name:       i.Name,
-			Dockerfile: i.DockerfilePath,
-			Image:      i.Image,
+			Name:                    i.Name,
+			Dockerfile:              i.DockerfilePath,
+			Image:                   i.Image,
+			PrivateOnlyEnvironments: i.PrivateOnlyEnvironments,
 		},
 		Port:        i.Port,
 		HealthCheck: i.HealthCheck,
@@ -365,42 +373,33 @@ func newBackendServiceManifest(i *ServiceProps) (*manifest.BackendService, error
 func newWorkerServiceManifest(i *ServiceProps) (*manifest.WorkerService, error) {
 	return manifest.NewWorkerService(manifest.WorkerServiceProps{
 		WorkloadProps: manifest.WorkloadProps{
-			Name:       i.Name,
-			Dockerfile: i.DockerfilePath,
-			Image:      i.Image,
+			Name:                    i.Name,
+			Dockerfile:              i.DockerfilePath,
+			Image:                   i.Image,
+			PrivateOnlyEnvironments: i.PrivateOnlyEnvironments,
 		},
 		HealthCheck: i.HealthCheck,
 		Platform:    i.Platform,
 		Topics:      i.Topics,
+		Queue:       i.Queue,
 	}), nil
 }
 
-// relativeDockerfilePath returns the path from the workspace root to the Dockerfile.
-func relativeDockerfilePath(ws Workspace, path string) (string, error) {
-	wsRoot, err := ws.Path()
-	if err != nil {
-		return "", fmt.Errorf("get workspace path: %w", err)
+// Copy of cli.displayPath
+func displayPath(target string) string {
+	if !filepath.IsAbs(target) {
+		return filepath.Clean(target)
 	}
-	absDfPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("get absolute path: %v", err)
-	}
-	relDfPath, err := filepath.Rel(wsRoot, absDfPath)
-	if err != nil {
-		return "", fmt.Errorf("find relative path from workspace root to Dockerfile: %v", err)
-	}
-	return relDfPath, nil
-}
 
-// relPath returns the path relative to the current working directory.
-func relPath(fullPath string) (string, error) {
-	wkdir, err := os.Getwd()
+	base, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("get working directory: %w", err)
+		return filepath.Clean(target)
 	}
-	path, err := filepath.Rel(wkdir, fullPath)
+
+	rel, err := filepath.Rel(base, target)
 	if err != nil {
-		return "", fmt.Errorf("get relative path of file: %w", err)
+		// No path from base to target available, return target as is.
+		return filepath.Clean(target)
 	}
-	return path, nil
+	return rel
 }

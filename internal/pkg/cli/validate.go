@@ -22,7 +22,7 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/addon"
 	"github.com/aws/copilot-cli/internal/pkg/aws/apprunner"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
-	"github.com/aws/copilot-cli/internal/pkg/template"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 )
 
 var (
@@ -60,8 +60,8 @@ var (
 	errTooManyLSIKeys                     = errors.New("number of specified LSI sort keys must be 5 or less")
 
 	// Aurora-Serverless-specific errors.
-	errInvalidRDSNameCharacters    = errors.New("value must start with a letter")
-	errRDWSNotConnectedToVPC       = fmt.Errorf("%s requires a VPC connection", manifest.RequestDrivenWebServiceType)
+	errInvalidRDSNameCharacters    = errors.New("value must start with a letter and followed by alphanumeric letters only")
+	errRDWSNotConnectedToVPC       = fmt.Errorf("%s requires a VPC connection", manifestinfo.RequestDrivenWebServiceType)
 	fmtErrInvalidEngineType        = "invalid engine type %s: must be one of %s"
 	fmtErrInvalidDBNameCharacters  = "invalid database name %s: must contain only alphanumeric characters and underscore; should start with a letter"
 	errInvalidSecretNameCharacters = errors.New("value must contain only letters, numbers, periods, hyphens and underscores")
@@ -170,7 +170,7 @@ func reservedWorkloadNames() map[string]bool {
 	}
 }
 
-func validateAppName(val interface{}) error {
+func validateAppNameString(val interface{}) error {
 	if err := basicNameValidation(val); err != nil {
 		return fmt.Errorf("application name %v is invalid: %w", val, err)
 	}
@@ -180,7 +180,7 @@ func validateAppName(val interface{}) error {
 func validateSvcName(val interface{}, svcType string) error {
 	var err error
 	switch svcType {
-	case manifest.RequestDrivenWebServiceType:
+	case manifestinfo.RequestDrivenWebServiceType:
 		err = validateAppRunnerSvcName(val)
 	default:
 		err = basicNameValidation(val)
@@ -188,11 +188,9 @@ func validateSvcName(val interface{}, svcType string) error {
 	if err != nil {
 		return fmt.Errorf("service name %v is invalid: %w", val, err)
 	}
-
 	if err := validateNotReservedWorkloadName(val); err != nil {
 		return fmt.Errorf("service name %v is invalid: %w", val, err)
 	}
-
 	return nil
 }
 
@@ -220,7 +218,7 @@ func validateSvcType(val interface{}) error {
 	if !ok {
 		return errValueNotAString
 	}
-	return validateWorkloadType(svcType, manifest.ServiceTypes(), service)
+	return validateWorkloadType(svcType, manifestinfo.ServiceTypes(), service)
 }
 
 func validateWorkloadType(wkldType string, validTypes []string, errFlavor string) error {
@@ -238,7 +236,7 @@ func validateJobType(val interface{}) error {
 	if !ok {
 		return errValueNotAString
 	}
-	return validateWorkloadType(jobType, manifest.JobTypes(), job)
+	return validateWorkloadType(jobType, manifestinfo.JobTypes(), job)
 }
 
 func validateJobName(val interface{}) error {
@@ -254,7 +252,7 @@ func validateJobName(val interface{}) error {
 func validatePipelineName(val interface{}, appName string) error {
 	// compute the longest name a user can name their pipeline for this app
 	// since we prefix their name with 'pipeline-[app]-'. the limit is required
-	// because its the name we give the cfn stack for the pipeline.
+	// because it's the name we give the cfn stack for the pipeline.
 	maxNameLen := maxPipelineStackNameLen - len(fmt.Sprintf(fmtPipelineStackName, appName, ""))
 	errFmt := "pipeline name %v is invalid: %w"
 
@@ -366,7 +364,7 @@ func validateAuroraStorageType(ws manifestReader, workloadName string) error {
 	if err != nil {
 		return fmt.Errorf("invalid storage type %s: read type of workload from manifest file for %s: %w", rdsStorageType, workloadName, err)
 	}
-	if mftType != manifest.RequestDrivenWebServiceType {
+	if mftType != manifestinfo.RequestDrivenWebServiceType {
 		return nil
 	}
 	data := struct {
@@ -792,7 +790,7 @@ func validatePubSubName(name string) error {
 }
 
 func prettify(inputStrings []string) string {
-	prettyTypes := template.QuoteSliceFunc(inputStrings)
+	prettyTypes := applyAll(inputStrings, strconv.Quote)
 	return strings.Join(prettyTypes, ", ")
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"gopkg.in/yaml.v3"
 )
 
@@ -16,13 +17,31 @@ var (
 
 // Storage represents the options for external and native storage.
 type Storage struct {
-	Ephemeral *int               `yaml:"ephemeral"`
-	Volumes   map[string]*Volume `yaml:"volumes"` // NOTE: keep the pointers because `mergo` doesn't automatically deep merge map's value unless it's a pointer type.
+	Ephemeral      *int               `yaml:"ephemeral"`
+	ReadonlyRootFS *bool              `yaml:"readonly_fs"`
+	Volumes        map[string]*Volume `yaml:"volumes"` // NOTE: keep the pointers because `mergo` doesn't automatically deep merge map's value unless it's a pointer type.
 }
 
 // IsEmpty returns empty if the struct has all zero members.
 func (s *Storage) IsEmpty() bool {
-	return s.Ephemeral == nil && s.Volumes == nil
+	return s.Ephemeral == nil && s.Volumes == nil && s.ReadonlyRootFS == nil
+}
+
+func (s *Storage) requiredEnvFeatures() []string {
+	if s.hasManagedFS() {
+		return []string{template.EFSFeatureName}
+	}
+	return nil
+}
+
+func (s *Storage) hasManagedFS() bool {
+	for _, v := range s.Volumes {
+		if v.EmptyVolume() || !v.EFS.UseManagedFS() {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // Volume is an abstraction which merges the MountPoint and Volumes concepts from the ECS Task Definition

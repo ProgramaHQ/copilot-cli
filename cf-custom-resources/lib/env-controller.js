@@ -16,6 +16,11 @@ const updateStackWaiter = {
 
 const AliasParamKey = "Aliases";
 
+// Per the doc at https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/crpg-ref-responses.html
+// the size of the response body should not exceed 4096 bytes.
+// Therefore, we should ignore any outputs that we don't need.
+let ignoredEnvOutputs = new Set(["EnabledFeatures", "LastForceDeployID"]);
+
 /**
  * Upload a CloudFormation response object to S3.
  *
@@ -117,7 +122,11 @@ const controlEnv = async function (
       (param) => !envSet.has(param)
     );
     const exportedValues = getExportedValues(updatedEnvStack);
-    // Return if there are no parameter changes.
+    // If there are no changes in env-controller managed parameters, the custom 
+    // resource may have been triggered because the env template is upgraded, 
+    // and the service template is attempting to retrieve the latest Outputs
+    // from the env stack (see PR #3957). Return the updated Outputs instead 
+    // of triggering an env-controller update of the environment.
     const shouldUpdateAliases = needUpdateAliases(envParams, workload, aliases);
     if (
       parametersToRemove.length + parametersToAdd.length === 0 &&
@@ -308,6 +317,9 @@ const updateAliases = function (cfnAliases, workload, aliases) {
 const getExportedValues = function (stack) {
   const exportedValues = {};
   stack.Outputs.forEach((output) => {
+    if (ignoredEnvOutputs.has(output.OutputKey)) {
+      return;
+    }
     exportedValues[output.OutputKey] = output.OutputValue;
   });
   return exportedValues;

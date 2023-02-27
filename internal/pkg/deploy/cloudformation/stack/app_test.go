@@ -46,9 +46,15 @@ func TestAppTemplate(t *testing.T) {
 				m.EXPECT().Parse(appTemplatePath, struct {
 					TemplateVersion         string
 					AppDNSDelegatedAccounts []string
+					Domain                  string
+					Name                    string
+					PermissionsBoundary     string
 				}{
 					"v1.0.0",
 					[]string{"123456"},
+					"",
+					"demo",
+					"",
 				}, gomock.Any()).Return(&template.Content{
 					Buffer: bytes.NewBufferString("template"),
 				}, nil)
@@ -66,8 +72,11 @@ func TestAppTemplate(t *testing.T) {
 			defer ctrl.Finish()
 			appStack := &AppStackConfig{
 				CreateAppInput: &deploy.CreateAppInput{
-					Version:   tc.inVersion,
-					AccountID: "123456",
+					Version:             tc.inVersion,
+					AccountID:           "123456",
+					Name:                "demo",
+					DomainName:          "",
+					PermissionsBoundary: "",
 				},
 			}
 			tc.mockDependencies(ctrl, appStack)

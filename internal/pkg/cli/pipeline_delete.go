@@ -6,6 +6,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"github.com/aws/copilot-cli/internal/pkg/term/selector"
 	"github.com/aws/copilot-cli/internal/pkg/workspace"
+	"github.com/spf13/afero"
 
 	"github.com/spf13/cobra"
 )
@@ -75,9 +77,9 @@ type deletePipelineOpts struct {
 }
 
 func newDeletePipelineOpts(vars deletePipelineVars) (*deletePipelineOpts, error) {
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new workspace client: %w", err)
+		return nil, err
 	}
 
 	defaultSess, err := sessions.ImmutableProvider(sessions.UserAgentExtras("pipeline delete")).Default()
@@ -95,11 +97,11 @@ func newDeletePipelineOpts(vars deletePipelineVars) (*deletePipelineOpts, error)
 		prog:                   termprogress.NewSpinner(log.DiagnosticWriter),
 		prompt:                 prompter,
 		secretsmanager:         secretsmanager.New(defaultSess),
-		pipelineDeployer:       cloudformation.New(defaultSess),
+		pipelineDeployer:       cloudformation.New(defaultSess, cloudformation.WithProgressTracker(os.Stderr)),
 		deployedPipelineLister: pipelineLister,
 		ws:                     ws,
 		store:                  ssmStore,
-		sel:                    selector.NewAppPipelineSelect(prompter, ssmStore, pipelineLister),
+		sel:                    selector.NewAppPipelineSelector(prompter, ssmStore, pipelineLister),
 	}
 
 	return opts, nil

@@ -4,7 +4,7 @@
 
 Service を作成して AWS 上でコンテナを実行するための方法は複数あります。もっとも簡単な方法は、Dockerfile が置かれたディレクトリで `init` コマンドを実行することです。
 
-```bash
+```console
 $ copilot init
 ```
 
@@ -29,7 +29,7 @@ Service のタイプを選択すると、Copilot は Dockerfile 内で記述さ�
 
 AWS App Runner を利用する Service で、受け付けるトラフィックに応じてオートスケールし、トラフィックがない場合は設定された最低インスタンス数までスケールダウンします。リクエスト量の大きな変化や恒常的な少ないリクエスト量が見込まれる HTTP サービスにとってもよりコスト効率の高い選択肢です。
 ECS とは異なり、 App Runner サービスはデフォルトでは VPC とは接続されていません。 Egress トラフィックを VPC 経由でルーティングするには、
-マニフェスト内の[`network`](../manifest/rd-web-service.ja.md#network)フィールドを設定します。
+Manifest 内の[`network`](../manifest/rd-web-service.ja.md#network)フィールドを設定します。
 
 #### Load Balanced Web Service
 
@@ -46,7 +46,7 @@ Application Load Balancer は Environment レベルのリソースであり、En
 ### Backend Service
 
 VPC 外部からアクセスさせる必要はないが、Application 内の他の Service からはアクセスできる必要があるという場合は、 __Backend Service__ を
-作りましょう。Copilot は AWS Fargate で実行される ECS サービスを作成しますが、インターネットに向けて開放されたエンドポイントを作成することはありません。
+作りましょう。Copilot は AWS Fargate で実行される ECS サービスを作成しますが、インターネットに向けて開放されたエンドポイントを作成することはありません。内部ロードバランサーを利用する Backend Service について知りたい場合は、[こちら](../developing/internal-albs.ja.md)を確認してください。
 
 ![backend-service-infra](https://user-images.githubusercontent.com/879348/86046929-e8673400-ba02-11ea-8676-addd6042e517.png)
 
@@ -65,7 +65,7 @@ Worker Service は次の要素で構成されます。
 
 ## Manifest と設定
 <!-- textlint-disable ja-technical-writing/ja-no-weak-phrase -->
-`copilot init` コマンドを実行すると、Copilot が `manifest.yml` という名前のファイルを copilot ディレクトリ内に作成していることに気づいたかもしれません。この Manifest ファイルは Service 用の共通設定やオプションを持ちます。どのようなオプションがあるかはあなたが選択した Service のタイプによって異なりますが、共通の設定には例えば Service に割り当てるメモリや CPU のリソース量、ヘルスチェック、環境変数といったものが含まれます。
+`copilot init` コマンドを実行すると、Copilot が `manifest.yml` という名前のファイルを `copilot/[service name]/` ディレクトリ内に作成していることに気づいたかもしれません。この Manifest ファイルは Service 用の共通設定やオプションを持ちます。どのようなオプションがあるかはあなたが選択した Service のタイプによって異なりますが、共通の設定には例えば Service に割り当てるメモリや CPU のリソース量、ヘルスチェック、環境変数といったものが含まれます。
 <!-- textlint-enable ja-technical-writing/ja-no-weak-phrase -->
 
 _front-end_ という名前の Load Balanced Web Service 用に作られた Manifest ファイルを覗いてみましょう。
@@ -113,7 +113,7 @@ Manifest ファイルの仕様について学ぶには、[Manifest](../manifest/
 
 Service をセットアップしたら、あるいは Manifest ファイルに変更を加えたら、deploy コマンドを実行して Service をデプロイできます。
 
-```bash
+```console
 $ copilot deploy
 ```
 
@@ -135,7 +135,7 @@ Service のセットアップと実行が完了したので、Copilot を使っ�
 
 `copilot svc show` コマンドを実行すると、Service のサマリ情報を表示します。以下は Load Balanced Web Application での出力の例です。各 Environment ごとの Service 設定や Service のエンドポイント、あるいは環境変数などが確認できます。さらに、`--resources` フラグを利用することでこの Service に紐づけられたすべての AWS リソースを確認できます。
 
-```bash
+```console
 $ copilot svc show
 About
 
@@ -173,7 +173,7 @@ Variables
 Service のすべてのタスクは Healthy だろうか？なにかアラームが発火していないか？など、Service のステータスを確認できると便利です。Copilot では、`copilot svc status` でそのような情報のサマリを確認できます。
 
 
-```bash
+```console
 $ copilot svc status
 Service Status
 
@@ -199,7 +199,7 @@ Alarms
 
 Service のログの確認も簡単です。`copilot svc logs` コマンドを実行すると、直近の Service ログを確認できます。`--follow` フラグをあわせて利用すると、Service 側のログの出力をライブに追いかけることもできます。
 
-```bash
+```console
 $ copilot svc logs
 37236ed 10.0.0.30 🚑 Health-check ok!
 37236ed 10.0.0.30 🚑 Health-check ok!

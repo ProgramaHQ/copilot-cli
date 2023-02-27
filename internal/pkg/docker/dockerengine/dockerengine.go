@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
@@ -147,7 +146,7 @@ func (c CmdClient) Login(uri, username, password string) error {
 
 // Push pushes the images with the specified tags and ecr repository URI, and returns the image digest on success.
 func (c CmdClient) Push(uri string, tags ...string) (digest string, err error) {
-	images := []string{uri}
+	images := []string{}
 	for _, tag := range tags {
 		images = append(images, imageName(uri, tag))
 	}
@@ -226,9 +225,6 @@ func (c CmdClient) GetPlatform() (os, arch string, err error) {
 }
 
 func imageName(uri, tag string) string {
-	if tag == "" {
-		return uri // If no tag is specified build with latest.
-	}
 	return fmt.Sprintf("%s:%s", uri, tag)
 }
 
@@ -243,7 +239,7 @@ func (c CmdClient) IsEcrCredentialHelperEnabled(uri string) bool {
 	// Look into the default locations
 	pathsToTry := []string{filepath.Join(".docker", "config.json"), ".dockercfg"}
 	for _, path := range pathsToTry {
-		content, err := ioutil.ReadFile(filepath.Join(c.homePath, path))
+		content, err := os.ReadFile(filepath.Join(c.homePath, path))
 		if err != nil {
 			// if we can't read the file keep going
 			continue

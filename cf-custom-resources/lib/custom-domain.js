@@ -4,6 +4,11 @@
 
 const aws = require("aws-sdk");
 
+const changeRecordAction = {
+  Upsert: "UPSERT",
+  Delete: "DELETE",
+}
+
 // These are used for test purposes only
 let defaultResponseURL;
 let defaultLogGroup;
@@ -81,8 +86,8 @@ let report = function (
  * it is corresponding hosted zone is not managable by Copilot.
  *
  * @param {string} aliases the custom domain aliases
- * @param {string} lbDNS DNS of the load balancer
- * @param {string} lbHostedZone Hosted Zone of the load balancer
+ * @param {string} accessDNS DNS of the public access
+ * @param {string} accessHostedZone Hosted Zone of the public access
  * @param {string} rootDnsRole the IAM role ARN that can manage domainName
  * @param {string} aliasTypes the alias type
  */
@@ -90,8 +95,8 @@ const writeCustomDomainRecord = async function (
   appRoute53,
   envRoute53,
   aliases,
-  lbDNS,
-  lbHostedZone,
+  accessDNS,
+  accessHostedZone,
   aliasTypes,
   action
 ) {
@@ -102,8 +107,8 @@ const writeCustomDomainRecord = async function (
         await writeARecord(
           envRoute53,
           alias,
-          lbDNS,
-          lbHostedZone,
+          accessDNS,
+          accessHostedZone,
           aliasType.domain,
           action
         );
@@ -112,8 +117,8 @@ const writeCustomDomainRecord = async function (
         await writeARecord(
           appRoute53,
           alias,
-          lbDNS,
-          lbHostedZone,
+          accessDNS,
+          accessHostedZone,
           aliasType.domain,
           action
         );
@@ -122,8 +127,8 @@ const writeCustomDomainRecord = async function (
         await writeARecord(
           appRoute53,
           alias,
-          lbDNS,
-          lbHostedZone,
+          accessDNS,
+          accessHostedZone,
           aliasType.domain,
           action
         );
@@ -137,8 +142,8 @@ const writeCustomDomainRecord = async function (
 const writeARecord = async function (
   route53,
   alias,
-  lbDNS,
-  lbHostedZone,
+  accessDNS,
+  accessHostedZone,
   domain,
   action
 ) {
@@ -158,16 +163,27 @@ const writeARecord = async function (
     hostedZoneCache.set(domain, hostedZoneId);
   }
   console.log(`${action} A record into Hosted Zone ${hostedZoneId}`);
-  const changeBatch = await updateRecords(
-    route53,
-    hostedZoneId,
-    action,
-    alias,
-    lbDNS,
-    lbHostedZone
-  );
-  await waitForRecordChange(route53, changeBatch.ChangeInfo.Id);
+  try {
+    const changeBatch = await updateRecords(
+      route53,
+      hostedZoneId,
+      action,
+      alias,
+      accessDNS,
+      accessHostedZone
+    );
+    await waitForRecordChange(route53, changeBatch.ChangeInfo.Id);
+  } catch (err) {
+    if (action === changeRecordAction.Delete && isRecordSetNotFoundErr(err)) {
+      console.log(`${err.message}; Copilot is ignoring this record.`);
+      return;
+    }
+    throw err;
+  }
 };
+
+// Example error message: "InvalidChangeBatch: [Tried to delete resource record set [name='a.domain.com.', type='A'] but it was not found]"
+const isRecordSetNotFoundErr = (err) => err.message.includes("Tried to delete resource record set") && err.message.includes("but it was not found")
 
 /**
  * Custom domain handler, invoked by Lambda.
@@ -211,10 +227,10 @@ exports.handler = async function (event, context) {
           appRoute53,
           envRoute53,
           aliases,
-          props.LoadBalancerDNS,
-          props.LoadBalancerHostedZone,
+          props.PublicAccessDNS,
+          props.PublicAccessHostedZone,
           aliasTypes,
-          "UPSERT"
+          changeRecordAction.Upsert,
         );
         break;
       case "Update":
@@ -222,10 +238,10 @@ exports.handler = async function (event, context) {
           appRoute53,
           envRoute53,
           aliases,
-          props.LoadBalancerDNS,
-          props.LoadBalancerHostedZone,
+          props.PublicAccessDNS,
+          props.PublicAccessHostedZone,
           aliasTypes,
-          "UPSERT"
+          changeRecordAction.Upsert,
         );
         // After upserting new aliases, delete unused ones. For example: previously we have ["foo.com", "bar.com"],
         // and now the aliases param is updated to just ["foo.com"] then we'll delete "bar.com".
@@ -239,10 +255,10 @@ exports.handler = async function (event, context) {
           appRoute53,
           envRoute53,
           aliasesToDelete,
-          props.LoadBalancerDNS,
-          props.LoadBalancerHostedZone,
+          props.PublicAccessDNS,
+          props.PublicAccessHostedZone,
           aliasTypes,
-          "DELETE"
+          changeRecordAction.Delete,
         );
         break;
       case "Delete":
@@ -250,10 +266,10 @@ exports.handler = async function (event, context) {
           appRoute53,
           envRoute53,
           aliases,
-          props.LoadBalancerDNS,
-          props.LoadBalancerHostedZone,
+          props.PublicAccessDNS,
+          props.PublicAccessHostedZone,
           aliasTypes,
-          "DELETE"
+          changeRecordAction.Delete
         );
         break;
       default:
@@ -323,8 +339,8 @@ const updateRecords = function (
   hostedZone,
   action,
   alias,
-  lbDNS,
-  lbHostedZone
+  accessDNS,
+  accessHostedZone
 ) {
   return route53
     .changeResourceRecordSets({
@@ -336,8 +352,8 @@ const updateRecords = function (
               Name: alias,
               Type: "A",
               AliasTarget: {
-                HostedZoneId: lbHostedZone,
-                DNSName: lbDNS,
+                HostedZoneId: accessHostedZone,
+                DNSName: accessDNS,
                 EvaluateTargetHealth: true,
               },
             },

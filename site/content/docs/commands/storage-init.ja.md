@@ -1,5 +1,5 @@
 # storage init
-```bash
+```console
 $ copilot storage init
 ```
 ## コマンドの概要
@@ -8,7 +8,7 @@ $ copilot storage init
 このコマンドを実行すると、CLI は `copilot/service` ディレクトリ内に、`addons` サブディレクトリが存在しなければ作成します。`copilot svc deploy` を実行すると、新規に初期化されたストレージリソースが、デプロイ先の環境に作成されます。デフォルトでは、`storage init` で指定したサービスのみが、そのストレージリソースにアクセスできます。
 
 ## フラグ
-```bash
+```
 Required Flags
   -n, --name string           Name of the storage resource to create.
   -t, --storage-type string   Type of storage to add. Must be one of:
@@ -25,25 +25,26 @@ DynamoDB Flags
       --sort-key string        Optional. Sort key for the DDB table.
                                Must be of the format '<keyName>:<dataType>'.
 Aurora Serverless Flags
-      --engine string           The database engine used in the cluster.
-                                Must be either "MySQL" or "PostgreSQL".
-      --parameter-group string  Optional. The name of the parameter group to associate with the cluster.
-      --initial-db string       The initial database to create in the cluster.
+      --engine string               The database engine used in the cluster.
+                                    Must be either "MySQL" or "PostgreSQL".
+      --initial-db string           The initial database to create in the cluster.
+      --parameter-group string      Optional. The name of the parameter group to associate with the cluster.
+      --serverless-version string   Optional. Aurora Serverless version. Must be either "v1" or "v2". (default "v2")
 ```
 
 ## 使用例
 "frontend" Service に "my-bucket" という名前の S3 バケットを作成します。
-```
+```console
 $ copilot storage init -n my-bucket -t S3 -w frontend
 ```
 
 "frontend" Service にアタッチされた "my-table" という名前の基本的な DynamoDB テーブルを、ソートキーを指定して作成します。
-```
+```console
 $ copilot storage init -n my-table -t DynamoDB -w frontend --partition-key Email:S --sort-key UserId:N --no-lsi
 ```
 
 複数の代替ソートキーを持つ DynamoDB テーブルを作成します。
-```
+```console
 $ copilot storage init \
   -n my-table -t DynamoDB -w frontend \
   --partition-key Email:S \
@@ -52,19 +53,25 @@ $ copilot storage init \
   --lsi Goodness:N
 ```
 
-データベースエンジンに PostgreSQL を使用して、RDS Aurora Serverless クラスタを作成します。
-```
+データベースエンジンに PostgreSQL を使用して、RDS Aurora Serverless v2 クラスタを作成します。
+```console
 $ copilot storage init \
   -n my-cluster -t Aurora -w frontend --engine PostgreSQL
 ```
 
+データベースエンジンに MySQL を使用し、初期データベース名を testdb として、RDS Aurora Serverless v1 クラスタを作成します。
+```console
+$ copilot storage init \
+  -n my-cluster -t Aurora --serverless-version v1 -w frontend --engine MySQL --initial-db testdb
+```
+
 ## コマンド内部での動作
-Copilotは、S3 バケットや DDB テーブルを指定した CloudFormation テンプレートを `addons` ディレクトリに格納します。`copilot svc deploy` を実行すると、CLI はこのテンプレートを addons ディレクトリ内の他のすべてのテンプレートとマージして、Service に関連付けられたネストされた (入れ子になった) スタックを作成します。このネストされたスタックには、その Service に関連付けられたすべての追加リソースが記述されており、その Service がデプロイできる場所ではどこにでもデプロイ可能です。
+Copilot は、S3 バケットや DDB テーブルを指定した CloudFormation テンプレートを `addons` ディレクトリに格納します。`copilot svc deploy` を実行すると、CLI はこのテンプレートを addons ディレクトリ内の他のすべてのテンプレートとマージして、Service に関連付けられたネストされた (入れ子になった) スタックを作成します。このネストされたスタックには、その Service に関連付けられたすべての追加リソースが記述されており、その Service がデプロイできる場所ではどこにでもデプロイ可能です。
 
 これは、実行後に、
-```
+```console
 $ copilot storage init -n bucket -t S3 -w fe
 $ copilot svc deploy -n fe -e test
 $ copilot svc deploy -n fe -e prod
 ```
-2 つのバケットがデプロイされます。1 つは "test" Environment、もう 1 つは "prod" Environmentで、それぞれの "fe" Service からのみアクセスできます。
+2 つのバケットがデプロイされます。1 つは "test" Environment、もう 1 つは "prod" Environment で、それぞれの "fe" Service からのみアクセスできます。

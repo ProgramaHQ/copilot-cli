@@ -5,13 +5,12 @@ package cli
 
 import (
 	"bytes"
+	"io"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/aws/copilot-cli/internal/pkg/addon"
 	"github.com/aws/copilot-cli/internal/pkg/cli/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/cli/mocks"
 	"github.com/aws/copilot-cli/internal/pkg/config"
@@ -113,7 +112,7 @@ func TestPackageSvcOpts_Ask(t *testing.T) {
 				sel:    m.sel,
 				store:  m.store,
 				ws:     m.ws,
-				runner: mocks.NewMockrunner(ctrl),
+				runner: mocks.NewMockexecRunner(ctrl),
 			}
 
 			// WHEN
@@ -130,6 +129,26 @@ func TestPackageSvcOpts_Ask(t *testing.T) {
 			}
 		})
 	}
+}
+
+type svcPackageExecuteMock struct {
+	ws                   *mocks.MockwsWlDirReader
+	generator            *mocks.MockworkloadStackGenerator
+	interpolator         *mocks.Mockinterpolator
+	envFeaturesDescriber *mocks.MockversionCompatibilityChecker
+	mft                  *mockWorkloadMft
+}
+
+type mockWriteCloser struct {
+	w io.Writer
+}
+
+func (wc mockWriteCloser) Write(p []byte) (n int, err error) {
+	return wc.w.Write(p)
+}
+
+func (wc mockWriteCloser) Close() error {
+	return nil
 }
 
 func TestPackageSvcOpts_Execute(t *testing.T) {
@@ -161,6 +180,7 @@ count: 1`
 		inVars packageSvcVars
 
 		mockDependencies func(*gomock.Controller, *packageSvcOpts)
+		setupMocks       func(m *svcPackageExecuteMock)
 
 		wantedStack  string
 		wantedParams string
@@ -176,47 +196,38 @@ count: 1`
 				clientConfigured: true,
 				uploadAssets:     true,
 			},
-			mockDependencies: func(ctrl *gomock.Controller, opts *packageSvcOpts) {
-				mockWs := mocks.NewMockwsWlDirReader(ctrl)
-				mockWs.EXPECT().
-					ReadWorkloadManifest("api").
-					Return([]byte(lbwsMft), nil)
-
-				mockGenerator := mocks.NewMockworkloadTemplateGenerator(ctrl)
-				mockGenerator.EXPECT().UploadArtifacts().Return(&deploy.UploadArtifactsOutput{
-					ImageDigest: aws.String(mockDigest),
+			setupMocks: func(m *svcPackageExecuteMock) {
+				m.ws.EXPECT().ReadWorkloadManifest("api").Return([]byte(lbwsMft), nil)
+				m.generator.EXPECT().UploadArtifacts().Return(&deploy.UploadArtifactsOutput{
+					ImageDigests: map[string]deploy.ContainerImageIdentifier{
+						"api": {
+							Digest: mockDigest,
+						},
+					},
 				}, nil)
-				mockGenerator.EXPECT().GenerateCloudFormationTemplate(&deploy.GenerateCloudFormationTemplateInput{
+				m.generator.EXPECT().GenerateCloudFormationTemplate(&deploy.GenerateCloudFormationTemplateInput{
 					StackRuntimeConfiguration: deploy.StackRuntimeConfiguration{
-						ImageDigest: aws.String(mockDigest),
+						ImageDigests: map[string]deploy.ContainerImageIdentifier{
+							"api": {
+								Digest: mockDigest,
+							},
+						},
 						RootUserARN: mockARN,
 					},
-				}).
-					Return(&deploy.GenerateCloudFormationTemplateOutput{
-						Template:   "mystack",
-						Parameters: "myparams",
-					}, nil)
-
-				mockItpl := mocks.NewMockinterpolator(ctrl)
-				mockItpl.EXPECT().Interpolate(lbwsMft).Return(lbwsMft, nil)
-
-				mockAddons := mocks.NewMocktemplater(ctrl)
-				mockAddons.EXPECT().Template().
-					Return("", &addon.ErrAddonsNotFound{})
-
-				opts.ws = mockWs
-				opts.initAddonsClient = func(opts *packageSvcOpts) error {
-					opts.addonsClient = mockAddons
-					return nil
+				}).Return(&deploy.GenerateCloudFormationTemplateOutput{
+					Template:   "mystack",
+					Parameters: "myparams",
+				}, nil)
+				m.interpolator.EXPECT().Interpolate(lbwsMft).Return(lbwsMft, nil)
+				m.generator.EXPECT().AddonsTemplate().Return("", nil)
+				m.envFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{}
+					},
 				}
-				opts.newInterpolator = func(app, env string) interpolator {
-					return mockItpl
-				}
-				opts.newTplGenerator = func(pso *packageSvcOpts) (workloadTemplateGenerator, error) {
-					return mockGenerator, nil
-				}
+				m.envFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{}, nil)
 			},
-
 			wantedStack:  "mystack",
 			wantedParams: "myparams",
 		},
@@ -228,44 +239,27 @@ count: 1`
 				tag:              "1234",
 				clientConfigured: true,
 			},
-			mockDependencies: func(ctrl *gomock.Controller, opts *packageSvcOpts) {
-				mockWs := mocks.NewMockwsWlDirReader(ctrl)
-				mockWs.EXPECT().
-					ReadWorkloadManifest("api").
-					Return([]byte(rdwsMft), nil)
-
-				mockItpl := mocks.NewMockinterpolator(ctrl)
-				mockItpl.EXPECT().Interpolate(rdwsMft).Return(rdwsMft, nil)
-
-				mockAddons := mocks.NewMocktemplater(ctrl)
-				mockAddons.EXPECT().Template().
-					Return("", &addon.ErrAddonsNotFound{})
-
-				mockGenerator := mocks.NewMockworkloadTemplateGenerator(ctrl)
-				mockGenerator.EXPECT().GenerateCloudFormationTemplate(&deploy.GenerateCloudFormationTemplateInput{
+			setupMocks: func(m *svcPackageExecuteMock) {
+				m.ws.EXPECT().ReadWorkloadManifest("api").Return([]byte(rdwsMft), nil)
+				m.interpolator.EXPECT().Interpolate(rdwsMft).Return(rdwsMft, nil)
+				m.generator.EXPECT().AddonsTemplate().Return("", nil)
+				m.envFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{}
+					},
+				}
+				m.envFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{}, nil)
+				m.generator.EXPECT().GenerateCloudFormationTemplate(&deploy.GenerateCloudFormationTemplateInput{
 					StackRuntimeConfiguration: deploy.StackRuntimeConfiguration{
-						ImageDigest: aws.String(""),
 						RootUserARN: mockARN,
 					},
-				}).
-					Return(&deploy.GenerateCloudFormationTemplateOutput{
-						Template:   "mystack",
-						Parameters: "myparams",
-					}, nil)
+				}).Return(&deploy.GenerateCloudFormationTemplateOutput{
+					Template:   "mystack",
+					Parameters: "myparams",
+				}, nil)
 
-				opts.ws = mockWs
-				opts.initAddonsClient = func(opts *packageSvcOpts) error {
-					opts.addonsClient = mockAddons
-					return nil
-				}
-				opts.newInterpolator = func(app, env string) interpolator {
-					return mockItpl
-				}
-				opts.newTplGenerator = func(pso *packageSvcOpts) (workloadTemplateGenerator, error) {
-					return mockGenerator, nil
-				}
 			},
-
 			wantedStack:  "mystack",
 			wantedParams: "myparams",
 		},
@@ -280,20 +274,36 @@ count: 1`
 			stackBuf := new(bytes.Buffer)
 			paramsBuf := new(bytes.Buffer)
 			addonsBuf := new(bytes.Buffer)
+
+			m := &svcPackageExecuteMock{
+				ws:                   mocks.NewMockwsWlDirReader(ctrl),
+				generator:            mocks.NewMockworkloadStackGenerator(ctrl),
+				interpolator:         mocks.NewMockinterpolator(ctrl),
+				envFeaturesDescriber: mocks.NewMockversionCompatibilityChecker(ctrl),
+			}
+			tc.setupMocks(m)
 			opts := &packageSvcOpts{
 				packageSvcVars: tc.inVars,
 
-				stackWriter:  stackBuf,
-				paramsWriter: paramsBuf,
-				addonsWriter: addonsBuf,
-				unmarshal: func(b []byte) (manifest.WorkloadManifest, error) {
-					return &mockWorkloadMft{}, nil
+				templateWriter: mockWriteCloser{w: stackBuf},
+				paramsWriter:   mockWriteCloser{w: paramsBuf},
+				addonsWriter:   mockWriteCloser{w: addonsBuf},
+				unmarshal: func(b []byte) (manifest.DynamicWorkload, error) {
+					return m.mft, nil
 				},
 				rootUserARN: mockARN,
-				targetApp:   &config.Application{},
-				targetEnv:   &config.Environment{},
+				ws:          m.ws,
+				newInterpolator: func(_, _ string) interpolator {
+					return m.interpolator
+				},
+				newStackGenerator: func(_ *packageSvcOpts) (workloadStackGenerator, error) {
+					return m.generator, nil
+				},
+				envFeaturesDescriber: m.envFeaturesDescriber,
+				targetApp:            &config.Application{},
+				targetEnv:            &config.Environment{},
 			}
-			tc.mockDependencies(ctrl, opts)
+			// tc.mockDependencies(ctrl, opts)
 
 			// WHEN
 			err := opts.Execute()

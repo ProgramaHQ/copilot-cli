@@ -1,31 +1,91 @@
 List of all available properties for a Copilot pipeline manifest. To learn more about pipelines, see the [Pipelines](../concepts/pipelines.en.md) concept page.
 
-???+ note "Sample manifest for a pipeline triggered from a GitHub repo"
+???+ note "Sample continuous delivery pipeline manifests"
 
-    ```yaml
-        name: frontend
+    === "Release workloads"
+        ```yaml
+        # The "app-pipeline" will deploy all the services and jobs in the user/repo
+        # to the "test" and "prod" environments.
+        name: app-pipeline
     
         source:
           provider: GitHub
           properties:
             branch: main
-            repository: https://github.com/<user>/frontend
+            repository: https://github.com/user/repo
             # Optional: specify the name of an existing CodeStar Connections connection.
-            connection_name: a-connection
+            # connection_name: a-connection
     
         build:
           image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+          # additional_policy: # Add additional permissions while building your container images and templates.
+    
+        stages: 
+          - # By default all workloads are deployed concurrently within a stage.
+            name: test
+            test_commands:
+              - make integ-test
+              - echo "woo! Tests passed"
+          -
+            name: prod
+            requires_approval: true
+        ```
+
+    === "Control order of deployments"
+
+        ```yaml
+        # Alternatively, you can control the order of stack deployments in a stage. 
+        # See https://aws.github.io/copilot-cli/blogs/release-v118/#controlling-order-of-deployments-in-a-pipeline
+        name: app-pipeline
+    
+        source:
+          provider: Bitbucket
+          properties:
+            branch: main
+            repository:  https://bitbucket.org/user/repo
     
         stages:
-            -
-              name: test
-              test_commands:
-                - make test
-                - echo "woo! Tests passed"
-            -
-              name: prod
-              requires_approval: true
-    ```
+          - name: test
+            deployments:
+              orders:
+              warehouse:
+              frontend:
+                depends_on: [orders, warehouse]
+          - name: prod
+            require_approval: true
+            deployments:
+              orders:
+              warehouse:
+              frontend:
+                depends_on: [orders, warehouse]
+        ```
+
+    === "Release environments"
+
+        ```yaml
+        # Environment manifests changes can also be released with a pipeline.
+        name: env-pipeline
+    
+        source:
+          provider: CodeCommit
+          properties:
+            branch: main
+            repository: https://git-codecommit.us-east-2.amazonaws.com/v1/repos/MyDemoRepo
+    
+        stages:
+          - name: test
+            deployments:
+              deploy-env:
+                template_path: infrastructure/test.env.yml
+                template_config: infrastructure/test.env.params.json
+                stack_name: app-test
+          - name: prod
+            deployments:
+              deploy-prod:
+                template_path: infrastructure/prod.env.yml
+                template_config: infrastructure/prod.env.params.json
+                stack_name: app-prod
+        ```
 
 <a id="name" href="#name" class="field">`name`</a> <span class="type">String</span>  
 The name of your pipeline.
@@ -75,7 +135,38 @@ Configuration for CodeBuild project.
 The URI that identifies the Docker image to use for this build project. As of now, `aws/codebuild/amazonlinux2-x86_64-standard:3.0` is used by default.
 
 <span class="parent-field">build.</span><a id="build-buildspec" href="#build-buildspec" class="field">`buildspec`</a> <span class="type">String</span>
-Optional. The URI that identifies a buildspec to use for this build project. By default, Copilot will generate one for you, located at `copilot/pipelines/[your pipeline name]/buildspec.yml.
+Optional. The URI that identifies a buildspec to use for this build project. By default, Copilot will generate one for you, located at `copilot/pipelines/[your pipeline name]/buildspec.yml`.
+
+<span class="parent-field">build.</span><a id="build-additional-policy" href="#build-additional-policy" class="field">`additional_policy.`</a><a id="policy-document" href="#policy-document" class="field">`PolicyDocument`</a> <span class="type">Map</span>
+Optional. Specify an additional policy document to add to the build project role.
+The additional policy document can be specified in a map in YAML, for example:
+```yaml
+build:
+  additional_policy:
+    PolicyDocument:
+      Version: 2012-10-17
+      Statement:
+        - Effect: Allow
+          Action:
+            - ecr:GetAuthorizationToken
+          Resource: '*'
+```
+or alternatively as JSON:
+```yaml
+build:
+  additional_policy:
+    PolicyDocument: 
+      {
+        “Statement": [
+          {
+            "Action": ["ecr:GetAuthorizationToken"],
+            "Effect": "Allow",
+            "Resource": "*"
+          }
+        ],
+        "Version": "2012-10-17"
+      }
+```
 
 <div class="separator"></div>
 
@@ -86,7 +177,64 @@ Ordered list of environments that your pipeline will deploy to.
 The name of an environment to deploy your services to.
 
 <span class="parent-field">stages.</span><a id="stages-approval" href="#stages-approval" class="field">`requires_approval`</a> <span class="type">Boolean</span>  
-Indicates whether to add a manual approval step before the deployment.
+Optional. Indicates whether to add a manual approval step before the deployment. Defaults to `false`.
+
+<span class="parent-field">stages.</span><a id="stages-deployments" href="#stages-deployments" class="field">`deployments`</a> <span class="type">Map</span>  
+Optional. Control which CloudFormation stacks to deploy and their order.  
+The `deployments` dependencies are specified in a map of the form:
+```yaml
+stages:
+  - name: test
+    deployments:
+      <service or job name>:
+      <other service or job name>:
+        depends_on: [<name>, ...]
+```
+
+For example, if your git repository has the following layout:
+```
+copilot
+├── api
+│   └── manifest.yml
+└── frontend
+    └── manifest.yml
+```
+
+And you'd like to control the order of your deployments, such that `api` is deployed before `frontend`, then you can configure your stage as follows:
+```yaml
+stages:
+  - name: test
+    deployments:
+      api:
+      frontend:
+        depends_on:
+          - api
+```
+You can also limit which microservices to release part of your pipeline. In the following manifest, we're specifying to deploy only `api` and not `frontend`:
+```yaml
+stages:
+  - name: test
+    deployments:
+      api:
+```
+
+Finally, if `deployments` isn't specified, by default Copilot will deploy all your services and job in the git repository in parallel.
+
+<span class="parent-field">stages.deployments.</span><a id="stages-deployments-name" href="#stages-deployments-name" class="field">`<name>`</a> <span class="type">Map</span>  
+Name of the job or service to deploy.  
+
+<span class="parent-field">stages.deployments.`<name>`.</span><a id="stages-deployments-dependson" href="#stages-deployments-dependson" class="field">`depends_on`</a> <span class="type">Array of Strings</span>    
+Optional. Name of other job or services that should be deployed prior to deploying this microservice. Defaults to no dependencies.  
+
+<span class="parent-field">stages.deployments.`<name>`.</span><a id="stages-deployments-stackname" href="#stages-deployments-stackname" class="field">`stack_name`</a> <span class="type">String</span>  
+Optional. Name of the stack to create or update. Defaults to `<app name>-<stage name>-<deployment name>`.  
+For example, if your application is called `demo`, stage name is `test`, and your service name is `frontend` then the stack name will be `demo-test-frontend`.  
+
+<span class="parent-field">stages.deployments.`<name>`.</span><a id="stages-deployments-templatepath" href="#stages-deployments-templatepath" class="field">`template_path`</a> <span class="type">String</span>  
+Optional. Path to the CloudFormation template generated during the `build` phase. Defaults to `infrastructure/<deployment name>-<stage name>.yml`.
+
+<span class="parent-field">stages.deployments.`<name>`.</span><a id="stages-deployments-templateconfig" href="#stages-deployments-templatepath" class="field">`template_config`</a> <span class="type">String</span>  
+Optional. Path to the CloudFormation template configuration generated during the `build` phase. Defaults to `infrastructure/<deployment name>-<stage name>.params.json`.
 
 <span class="parent-field">stages.</span><a id="stages-test-cmds" href="#stages-test-cmds" class="field">`test_commands`</a> <span class="type">Array of Strings</span>  
-Commands to run integration or end-to-end tests after deployment.
+Optional. Commands to run integration or end-to-end tests after deployment. Defaults to no post-deployment validations.

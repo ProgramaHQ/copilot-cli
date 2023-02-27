@@ -6,28 +6,33 @@ EnvControllerAction:
     ServiceToken: !GetAtt EnvControllerFunction.Arn
     Workload: !Ref WorkloadName
 {{- if .Aliases}}
-    Aliases: {{ fmtSlice .Aliases }}
+    Aliases: {{ fmtSlice (quoteSlice .Aliases) }}
 {{- end}}
     EnvStack: !Sub '${AppName}-${EnvName}'
     Parameters: {{ envControllerParams . }}
+    EnvVersion: {{.EnvVersion}}
 
 EnvControllerFunction:
   Type: AWS::Lambda::Function
   Properties:
+    {{- with $cr := index .CustomResources "EnvControllerFunction" }}
     Code:
-      ZipFile: |
-        {{.EnvControllerLambda}}
+      S3Bucket: {{$cr.Bucket}}
+      S3Key: {{$cr.Key}}
+    {{- end }}
     Handler: "index.handler"
     Timeout: 900
     MemorySize: 512
     Role: !GetAtt 'EnvControllerRole.Arn'
-    Runtime: nodejs12.x
+    Runtime: nodejs16.x
 
 EnvControllerRole:
+  Metadata:
+    'aws:copilot:description': "An IAM role {{- if .PermissionsBoundary}} with permissions boundary {{.PermissionsBoundary}} {{- end}} to update your environment stack"
   Type: AWS::IAM::Role
   Properties:
     AssumeRolePolicyDocument:
-      Version: 2012-10-17
+      Version: '2012-10-17'
       Statement:
         -
           Effect: Allow
@@ -36,6 +41,9 @@ EnvControllerRole:
               - lambda.amazonaws.com
           Action:
             - sts:AssumeRole
+    {{- if .PermissionsBoundary}}
+    PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/{{.PermissionsBoundary}}'
+    {{- end}}
     Path: /
     Policies:
       - PolicyName: "EnvControllerStackUpdate"

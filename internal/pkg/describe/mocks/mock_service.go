@@ -203,6 +203,21 @@ func (m *MockecsClient) EXPECT() *MockecsClientMockRecorder {
 	return m.recorder
 }
 
+// Service mocks base method.
+func (m *MockecsClient) Service(app, env, svc string) (*ecs.Service, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Service", app, env, svc)
+	ret0, _ := ret[0].(*ecs.Service)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Service indicates an expected call of Service.
+func (mr *MockecsClientMockRecorder) Service(app, env, svc interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Service", reflect.TypeOf((*MockecsClient)(nil).Service), app, env, svc)
+}
+
 // TaskDefinition mocks base method.
 func (m *MockecsClient) TaskDefinition(app, env, svc string) (*ecs.TaskDefinition, error) {
 	m.ctrl.T.Helper()
@@ -242,18 +257,33 @@ func (m *MockapprunnerClient) EXPECT() *MockapprunnerClientMockRecorder {
 }
 
 // DescribeService mocks base method.
-func (m *MockapprunnerClient) DescribeService(svcArn string) (*apprunner.Service, error) {
+func (m *MockapprunnerClient) DescribeService(svcARN string) (*apprunner.Service, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DescribeService", svcArn)
+	ret := m.ctrl.Call(m, "DescribeService", svcARN)
 	ret0, _ := ret[0].(*apprunner.Service)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // DescribeService indicates an expected call of DescribeService.
-func (mr *MockapprunnerClientMockRecorder) DescribeService(svcArn interface{}) *gomock.Call {
+func (mr *MockapprunnerClientMockRecorder) DescribeService(svcARN interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DescribeService", reflect.TypeOf((*MockapprunnerClient)(nil).DescribeService), svcArn)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DescribeService", reflect.TypeOf((*MockapprunnerClient)(nil).DescribeService), svcARN)
+}
+
+// PrivateURL mocks base method.
+func (m *MockapprunnerClient) PrivateURL(vicARN string) (string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "PrivateURL", vicARN)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// PrivateURL indicates an expected call of PrivateURL.
+func (mr *MockapprunnerClientMockRecorder) PrivateURL(vicARN interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PrivateURL", reflect.TypeOf((*MockapprunnerClient)(nil).PrivateURL), vicARN)
 }
 
 // MockworkloadStackDescriber is a mock of workloadStackDescriber interface.
@@ -277,6 +307,21 @@ func NewMockworkloadStackDescriber(ctrl *gomock.Controller) *MockworkloadStackDe
 // EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockworkloadStackDescriber) EXPECT() *MockworkloadStackDescriberMockRecorder {
 	return m.recorder
+}
+
+// Manifest mocks base method.
+func (m *MockworkloadStackDescriber) Manifest() ([]byte, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Manifest")
+	ret0, _ := ret[0].([]byte)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Manifest indicates an expected call of Manifest.
+func (mr *MockworkloadStackDescriberMockRecorder) Manifest() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Manifest", reflect.TypeOf((*MockworkloadStackDescriber)(nil).Manifest))
 }
 
 // Outputs mocks base method.
@@ -362,6 +407,21 @@ func (mr *MockecsDescriberMockRecorder) EnvVars() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnvVars", reflect.TypeOf((*MockecsDescriber)(nil).EnvVars))
 }
 
+// Manifest mocks base method.
+func (m *MockecsDescriber) Manifest() ([]byte, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Manifest")
+	ret0, _ := ret[0].([]byte)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Manifest indicates an expected call of Manifest.
+func (mr *MockecsDescriberMockRecorder) Manifest() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Manifest", reflect.TypeOf((*MockecsDescriber)(nil).Manifest))
+}
+
 // Outputs mocks base method.
 func (m *MockecsDescriber) Outputs() (map[string]string, error) {
 	m.ctrl.T.Helper()
@@ -407,6 +467,21 @@ func (mr *MockecsDescriberMockRecorder) Platform() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Platform", reflect.TypeOf((*MockecsDescriber)(nil).Platform))
 }
 
+// RollbackAlarmNames mocks base method.
+func (m *MockecsDescriber) RollbackAlarmNames() ([]string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RollbackAlarmNames")
+	ret0, _ := ret[0].([]string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RollbackAlarmNames indicates an expected call of RollbackAlarmNames.
+func (mr *MockecsDescriberMockRecorder) RollbackAlarmNames() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RollbackAlarmNames", reflect.TypeOf((*MockecsDescriber)(nil).RollbackAlarmNames))
+}
+
 // Secrets mocks base method.
 func (m *MockecsDescriber) Secrets() ([]*ecs.ContainerSecret, error) {
 	m.ctrl.T.Helper()
@@ -420,6 +495,21 @@ func (m *MockecsDescriber) Secrets() ([]*ecs.ContainerSecret, error) {
 func (mr *MockecsDescriberMockRecorder) Secrets() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Secrets", reflect.TypeOf((*MockecsDescriber)(nil).Secrets))
+}
+
+// ServiceConnectDNSNames mocks base method.
+func (m *MockecsDescriber) ServiceConnectDNSNames() ([]string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ServiceConnectDNSNames")
+	ret0, _ := ret[0].([]string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ServiceConnectDNSNames indicates an expected call of ServiceConnectDNSNames.
+func (mr *MockecsDescriberMockRecorder) ServiceConnectDNSNames() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServiceConnectDNSNames", reflect.TypeOf((*MockecsDescriber)(nil).ServiceConnectDNSNames))
 }
 
 // ServiceStackResources mocks base method.
@@ -458,6 +548,36 @@ func NewMockapprunnerDescriber(ctrl *gomock.Controller) *MockapprunnerDescriber 
 // EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockapprunnerDescriber) EXPECT() *MockapprunnerDescriberMockRecorder {
 	return m.recorder
+}
+
+// IsPrivate mocks base method.
+func (m *MockapprunnerDescriber) IsPrivate() (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "IsPrivate")
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// IsPrivate indicates an expected call of IsPrivate.
+func (mr *MockapprunnerDescriberMockRecorder) IsPrivate() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsPrivate", reflect.TypeOf((*MockapprunnerDescriber)(nil).IsPrivate))
+}
+
+// Manifest mocks base method.
+func (m *MockapprunnerDescriber) Manifest() ([]byte, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Manifest")
+	ret0, _ := ret[0].([]byte)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Manifest indicates an expected call of Manifest.
+func (mr *MockapprunnerDescriberMockRecorder) Manifest() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Manifest", reflect.TypeOf((*MockapprunnerDescriber)(nil).Manifest))
 }
 
 // Outputs mocks base method.

@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 
 	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/spf13/afero"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/cloudformation"
 	cs "github.com/aws/copilot-cli/internal/pkg/aws/codestar"
@@ -95,10 +97,9 @@ func newDeployPipelineOpts(vars deployPipelineVars) (*deployPipelineOpts, error)
 	store := config.NewSSMStore(identity.New(defaultSession), ssm.New(defaultSession), aws.StringValue(defaultSession.Config.Region))
 
 	prompter := prompt.New()
-
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new workspace client: %w", err)
+		return nil, err
 	}
 
 	wsAppName := tryReadingAppName()
@@ -108,20 +109,20 @@ func newDeployPipelineOpts(vars deployPipelineVars) (*deployPipelineOpts, error)
 
 	opts := &deployPipelineOpts{
 		ws:                 ws,
-		pipelineDeployer:   deploycfn.New(defaultSession),
+		pipelineDeployer:   deploycfn.New(defaultSession, deploycfn.WithProgressTracker(os.Stderr)),
 		region:             aws.StringValue(defaultSession.Config.Region),
 		deployPipelineVars: vars,
 		store:              store,
 		prog:               termprogress.NewSpinner(log.DiagnosticWriter),
 		prompt:             prompter,
-		sel:                selector.NewWsPipelineSelect(prompter, ws),
+		sel:                selector.NewWsPipelineSelector(prompter, ws),
 		codestar:           cs.New(defaultSession),
 		newSvcListCmd: func(w io.Writer, appName string) cmd {
 			return &listSvcOpts{
 				listWkldVars: listWkldVars{
 					appName: appName,
 				},
-				sel: selector.NewSelect(prompt.New(), store),
+				sel: selector.NewAppEnvSelector(prompt.New(), store),
 				list: &list.SvcListWriter{
 					Ws:    ws,
 					Store: store,
@@ -137,7 +138,7 @@ func newDeployPipelineOpts(vars deployPipelineVars) (*deployPipelineOpts, error)
 				listWkldVars: listWkldVars{
 					appName: appName,
 				},
-				sel: selector.NewSelect(prompt.New(), store),
+				sel: selector.NewAppEnvSelector(prompt.New(), store),
 				list: &list.JobListWriter{
 					Ws:    ws,
 					Store: store,
@@ -241,15 +242,20 @@ func (o *deployPipelineOpts) Execute() error {
 	if err != nil {
 		return err
 	}
+	var build deploy.Build
+	if err = build.Init(pipeline.Build, filepath.Dir(relPath)); err != nil {
+		return err
+	}
 	deployPipelineInput := &deploy.CreatePipelineInput{
-		AppName:         o.appName,
-		Name:            pipeline.Name,
-		IsLegacy:        isLegacy,
-		Source:          source,
-		Build:           deploy.PipelineBuildFromManifest(pipeline.Build, filepath.Dir(relPath)),
-		Stages:          stages,
-		ArtifactBuckets: artifactBuckets,
-		AdditionalTags:  o.app.Tags,
+		AppName:             o.appName,
+		Name:                pipeline.Name,
+		IsLegacy:            isLegacy,
+		Source:              source,
+		Build:               &build,
+		Stages:              stages,
+		ArtifactBuckets:     artifactBuckets,
+		AdditionalTags:      o.app.Tags,
+		PermissionsBoundary: o.app.PermissionsBoundary,
 	}
 
 	if err := o.deployPipeline(deployPipelineInput); err != nil {
@@ -329,19 +335,10 @@ func (o *deployPipelineOpts) convertStages(manifestStages []manifest.PipelineSta
 			return nil, fmt.Errorf("get environment %s in application %s: %w", stage.Name, o.appName, err)
 		}
 
-		pipelineStage := deploy.PipelineStage{
-			LocalWorkloads: workloads,
-			AssociatedEnvironment: &deploy.AssociatedEnvironment{
-				Name:      stage.Name,
-				Region:    env.Region,
-				AccountID: env.AccountID,
-			},
-			RequiresApproval: stage.RequiresApproval,
-			TestCommands:     stage.TestCommands,
-		}
-		stages = append(stages, pipelineStage)
+		var stg deploy.PipelineStage
+		stg.Init(env, &stage, workloads)
+		stages = append(stages, stg)
 	}
-
 	return stages, nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"gopkg.in/yaml.v3"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/ec2"
@@ -19,6 +20,7 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	cfnstack "github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
 	"github.com/aws/copilot-cli/internal/pkg/describe/stack"
+	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 )
 
@@ -131,6 +133,32 @@ func (d *EnvDescriber) Describe() (*EnvDescription, error) {
 	return d.description, nil
 }
 
+// Manifest returns the contents of the manifest used to deploy an environment stack.
+func (d *EnvDescriber) Manifest() ([]byte, error) {
+	tpl, err := d.cfn.StackMetadata()
+	if err != nil {
+		return nil, err
+	}
+
+	metadata := struct {
+		Manifest string `yaml:"Manifest"`
+	}{}
+	if err := yaml.Unmarshal([]byte(tpl), &metadata); err != nil {
+		return nil, fmt.Errorf("unmarshal Metadata.Manifest in environment stack: %v", err)
+	}
+
+	if metadata.Manifest != "" {
+		return []byte(strings.TrimSpace(metadata.Manifest)), nil
+	}
+	// Otherwise, the Manifest wasn't written into the CloudFormation template, we'll convert the config in SSM.
+	mft := manifest.FromEnvConfig(d.env, template.New())
+	out, err := yaml.Marshal(mft)
+	if err != nil {
+		return nil, fmt.Errorf("marshal manifest generated from SSM: %v", err)
+	}
+	return []byte(strings.TrimSpace(string(out))), nil
+}
+
 // Params returns the parameters of the environment stack.
 func (d *EnvDescriber) Params() (map[string]string, error) {
 	descr, err := d.cfn.Describe()
@@ -140,13 +168,28 @@ func (d *EnvDescriber) Params() (map[string]string, error) {
 	return descr.Parameters, nil
 }
 
-// Params returns the outputs of the environment stack.
+// Outputs returns the outputs of the environment stack.
 func (d *EnvDescriber) Outputs() (map[string]string, error) {
 	descr, err := d.cfn.Describe()
 	if err != nil {
 		return nil, err
 	}
 	return descr.Outputs, nil
+}
+
+// AvailableFeatures returns the available features of the environment stack.
+func (d *EnvDescriber) AvailableFeatures() ([]string, error) {
+	params, err := d.Params()
+	if err != nil {
+		return nil, err
+	}
+	var availableFeatures []string
+	for _, f := range template.AvailableEnvFeatures() {
+		if _, ok := params[f]; ok {
+			availableFeatures = append(availableFeatures, f)
+		}
+	}
+	return availableFeatures, nil
 }
 
 // Version returns the CloudFormation template version associated with
@@ -274,6 +317,48 @@ func (d *EnvDescriber) filterDeployedJobs() ([]*config.Workload, error) {
 	return deployedJobs, nil
 }
 
+// ValidateCFServiceDomainAliases returns error if an environment using cdn is deployed without specifying http.alias for all load-balanced web services
+func (d *EnvDescriber) ValidateCFServiceDomainAliases() error {
+	stackDescr, err := d.cfn.Describe()
+	if err != nil {
+		return fmt.Errorf("describe stack: %w", err)
+	}
+
+	servicesString, ok := stackDescr.Parameters[cfnstack.EnvParamALBWorkloadsKey]
+	if !ok {
+		return nil
+	}
+	services := strings.Split(servicesString, ",")
+
+	jsonOutput, ok := stackDescr.Parameters[cfnstack.EnvParamAliasesKey]
+	if !ok {
+		return fmt.Errorf("cannot find %s in env stack parameter set", cfnstack.EnvParamAliasesKey)
+	}
+
+	var aliases map[string][]string
+	if jsonOutput != "" {
+		err = json.Unmarshal([]byte(jsonOutput), &aliases)
+		if err != nil {
+			return fmt.Errorf("unmarshal %q: %w", jsonOutput, err)
+		}
+	}
+
+	var lbSvcsWithoutAlias []string
+	for _, service := range services {
+		if _, ok := aliases[service]; !ok {
+			lbSvcsWithoutAlias = append(lbSvcsWithoutAlias, service)
+		}
+	}
+	if len(lbSvcsWithoutAlias) != 0 {
+		return &errLBWebSvcsOnCFWithoutAlias{
+			services:   lbSvcsWithoutAlias,
+			aliasField: "http.alias",
+		}
+	}
+
+	return nil
+}
+
 // JSONString returns the stringified EnvDescription struct with json format.
 func (e *EnvDescription) JSONString() (string, error) {
 	b, err := json.Marshal(e)
@@ -290,7 +375,6 @@ func (e *EnvDescription) HumanString() string {
 	fmt.Fprint(writer, color.Bold.Sprint("About\n\n"))
 	writer.Flush()
 	fmt.Fprintf(writer, "  %s\t%s\n", "Name", e.Environment.Name)
-	fmt.Fprintf(writer, "  %s\t%t\n", "Production", e.Environment.Prod)
 	fmt.Fprintf(writer, "  %s\t%s\n", "Region", e.Environment.Region)
 	fmt.Fprintf(writer, "  %s\t%s\n", "Account ID", e.Environment.AccountID)
 	fmt.Fprint(writer, color.Bold.Sprint("\nWorkloads\n\n"))

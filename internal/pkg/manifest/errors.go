@@ -5,9 +5,11 @@ package manifest
 
 import (
 	"fmt"
-	"strconv"
-
+	"github.com/aws/copilot-cli/internal/pkg/aws/cloudfront"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/dustin/go-humanize/english"
+	"strconv"
+	"strings"
 )
 
 // ErrInvalidWorkloadType occurs when a user requested a manifest template type that doesn't exist.
@@ -55,17 +57,32 @@ func (e *ErrUnknownProvider) Is(target error) bool {
 }
 
 type errFieldMustBeSpecified struct {
-	missingField      string
-	conditionalFields []string
+	missingField       string
+	conditionalFields  []string
+	allMustBeSpecified bool
 }
 
 func (e *errFieldMustBeSpecified) Error() string {
-	errMsg := fmt.Sprintf(`"%s" must be specified`, e.missingField)
+	errMsg := fmt.Sprintf(`%q must be specified`, e.missingField)
 	if len(e.conditionalFields) == 0 {
 		return errMsg
 	}
-	return fmt.Sprintf(`%s if "%s" %s specified`, errMsg, english.WordSeries(e.conditionalFields, "or"),
+	conjunction := "or"
+	if e.allMustBeSpecified {
+		conjunction = "and"
+	}
+	return fmt.Sprintf(`%s if %s %s specified`, errMsg, english.WordSeries(quoteStringSlice(e.conditionalFields), conjunction),
 		english.PluralWord(len(e.conditionalFields), "is", "are"))
+}
+
+type errInvalidAutoscalingFieldsWithWkldType struct {
+	invalidFields []string
+	workloadType  string
+}
+
+func (e *errInvalidAutoscalingFieldsWithWkldType) Error() string {
+	return fmt.Sprintf("autoscaling %v %v %v invalid with workload type %v", english.PluralWord(len(e.invalidFields), "field", "fields"),
+		english.WordSeries(template.QuoteSliceFunc(e.invalidFields), "and"), english.PluralWord(len(e.invalidFields), "is", "are"), e.workloadType)
 }
 
 type errFieldMutualExclusive struct {
@@ -79,6 +96,55 @@ func (e *errFieldMutualExclusive) Error() string {
 		return fmt.Sprintf(`must specify one of "%s" and "%s"`, e.firstField, e.secondField)
 	}
 	return fmt.Sprintf(`must specify one, not both, of "%s" and "%s"`, e.firstField, e.secondField)
+}
+
+type errSpecifiedBothIngressFields struct {
+	firstField  string
+	secondField string
+}
+
+func (e *errSpecifiedBothIngressFields) Error() string {
+	return fmt.Sprintf(`must specify one, not both, of "%s" and "%s"`, e.firstField, e.secondField)
+}
+
+// RecommendActions returns recommended actions to be taken after the error.
+func (e *errSpecifiedBothIngressFields) RecommendActions() string {
+	privateOrPublicField := strings.Split(e.firstField, ".")[0]
+	if privateOrPublicField == "public" {
+		return `
+It looks like you specified ingress under both "http.public.security_groups.ingress" and "http.public.ingress".
+After Copilot v1.23.0, we have deprecated "http.public.security_groups.ingress" in favor of "http.public.ingress". 
+This means that "http.public.security_groups.ingress.cdn" is removed in favor of "http.public.ingress.cdn".
+With the new release manifest configuration for cdn looks like:
+
+http:
+  public:
+    ingress:
+      cdn: true
+`
+	}
+
+	return `
+It looks like you specified ingress under both "http.private.security_groups.ingress" and "http.private.ingress".
+After Copilot v1.23.0, we have deprecated "http.private.security_groups.ingress" in favor of "http.private.ingress". 
+This means that "http.private.security_groups.ingress.from_vpc" is removed in favor of "http.private.ingress.vpc".
+With the new release manifest configuration for vpc looks like:
+
+http:
+  private:
+    ingress:
+      vpc: true
+`
+}
+
+type errRangeValueLessThanZero struct {
+	min      int
+	max      int
+	spotFrom int
+}
+
+func (e *errRangeValueLessThanZero) Error() string {
+	return fmt.Sprintf("min value %d, max value %d, and spot_from value %d must all be positive", e.min, e.max, e.spotFrom)
 }
 
 type errMinGreaterThanMax struct {
@@ -96,13 +162,40 @@ type errAtLeastOneFieldMustBeSpecified struct {
 }
 
 func (e *errAtLeastOneFieldMustBeSpecified) Error() string {
-	quotedFields := make([]string, len(e.missingFields))
-	for i, f := range e.missingFields {
-		quotedFields[i] = strconv.Quote(f)
-	}
-	errMsg := fmt.Sprintf("must specify at least one of %s", english.WordSeries(quotedFields, "or"))
+	errMsg := fmt.Sprintf("must specify at least one of %s", english.WordSeries(quoteStringSlice(e.missingFields), "or"))
 	if e.conditionalField != "" {
 		errMsg = fmt.Sprintf(`%s if "%s" is specified`, errMsg, e.conditionalField)
 	}
 	return errMsg
+}
+
+type errInvalidCloudFrontRegion struct{}
+
+func (e *errInvalidCloudFrontRegion) Error() string {
+	return fmt.Sprintf(`cdn certificate must be in region %s`, cloudfront.CertRegion)
+}
+
+// RecommendActions returns recommended actions to be taken after the error.
+func (e *errInvalidCloudFrontRegion) RecommendActions() string {
+	return fmt.Sprintf(`It looks like your CloudFront certificate is in the wrong region. CloudFront only supports certificates in %s.
+We recommend creating a duplicate certificate in the %s region through AWS Certificate Manager.
+More information: https://go.aws/3BMxY4J`, cloudfront.CertRegion, cloudfront.CertRegion)
+}
+
+func quoteStringSlice(in []string) []string {
+	quoted := make([]string, len(in))
+	for idx, str := range in {
+		quoted[idx] = strconv.Quote(str)
+	}
+	return quoted
+}
+
+type errContainersExposingSamePort struct {
+	firstContainer  string
+	secondContainer string
+	port            uint16
+}
+
+func (e *errContainersExposingSamePort) Error() string {
+	return fmt.Sprintf(`containers %q and %q are exposing the same port %d`, e.firstContainer, e.secondContainer, e.port)
 }

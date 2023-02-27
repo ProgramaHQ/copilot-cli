@@ -18,7 +18,7 @@ describe("DNS Validated Certificate Handler", () => {
   const testDomainName = "example.com";
   const testAliases = `{"frontend": ["v1.${testEnvName}.${testAppName}.${testDomainName}", "foobar.com"]}`;
   const testUpdatedAliases = `{"frontend": ["v2.${testEnvName}.${testAppName}.${testDomainName}", "foobar.com"]}`;
-  const testLoadBalancerDNS =
+  const testAccessDNS =
     "examp-publi-gsedbvf8t12c-852245110.us-west-1.elb.amazonaws.com.";
   const testLBHostedZone = "Z1H1FL5HABSF5";
   const testHostedZoneId = "Z3P5QSUBK4POTI";
@@ -116,8 +116,8 @@ describe("DNS Validated Certificate Handler", () => {
           DomainName: testDomainName,
           Aliases: "badAliases",
           Region: "us-east-1",
-          LoadBalancerDNS: testLoadBalancerDNS,
-          LoadBalancerHostedZone: testLBHostedZone,
+          PublicAccessDNS: testAccessDNS,
+          PublicAccessHostedZone: testLBHostedZone,
           AppDNSRole: testRootDNSRole,
         },
       })
@@ -150,8 +150,8 @@ describe("DNS Validated Certificate Handler", () => {
           DomainName: testDomainName,
           Aliases: testAliases,
           Region: "us-east-1",
-          LoadBalancerDNS: testLoadBalancerDNS,
-          LoadBalancerHostedZone: testLBHostedZone,
+          PublicAccessDNS: testAccessDNS,
+          PublicAccessHostedZone: testLBHostedZone,
           AppDNSRole: testRootDNSRole,
         },
       })
@@ -203,8 +203,8 @@ describe("DNS Validated Certificate Handler", () => {
           DomainName: testDomainName,
           Aliases: testAliases,
           Region: "us-east-1",
-          LoadBalancerDNS: testLoadBalancerDNS,
-          LoadBalancerHostedZone: testLBHostedZone,
+          PublicAccessDNS: testAccessDNS,
+          PublicAccessHostedZone: testLBHostedZone,
           AppDNSRole: testRootDNSRole,
         },
       })
@@ -228,7 +228,7 @@ describe("DNS Validated Certificate Handler", () => {
                     Type: "A",
                     AliasTarget: {
                       HostedZoneId: testLBHostedZone,
-                      DNSName: testLoadBalancerDNS,
+                      DNSName: testAccessDNS,
                       EvaluateTargetHealth: true,
                     },
                   },
@@ -278,8 +278,8 @@ describe("DNS Validated Certificate Handler", () => {
           DomainName: testDomainName,
           Aliases: testUpdatedAliases,
           Region: "us-east-1",
-          LoadBalancerDNS: testLoadBalancerDNS,
-          LoadBalancerHostedZone: testLBHostedZone,
+          PublicAccessDNS: testAccessDNS,
+          PublicAccessHostedZone: testLBHostedZone,
           AppDNSRole: testRootDNSRole,
         },
         OldResourceProperties: {
@@ -301,7 +301,7 @@ describe("DNS Validated Certificate Handler", () => {
                     Type: "A",
                     AliasTarget: {
                       HostedZoneId: testLBHostedZone,
-                      DNSName: testLoadBalancerDNS,
+                      DNSName: testAccessDNS,
                       EvaluateTargetHealth: true,
                     },
                   },
@@ -323,7 +323,7 @@ describe("DNS Validated Certificate Handler", () => {
                     Type: "A",
                     AliasTarget: {
                       HostedZoneId: testLBHostedZone,
-                      DNSName: testLoadBalancerDNS,
+                      DNSName: testAccessDNS,
                       EvaluateTargetHealth: true,
                     },
                   },
@@ -373,8 +373,8 @@ describe("DNS Validated Certificate Handler", () => {
           DomainName: testDomainName,
           Aliases: testAliases,
           Region: "us-east-1",
-          LoadBalancerDNS: testLoadBalancerDNS,
-          LoadBalancerHostedZone: testLBHostedZone,
+          PublicAccessDNS: testAccessDNS,
+          PublicAccessHostedZone: testLBHostedZone,
           AppDNSRole: testRootDNSRole,
         },
       })
@@ -393,7 +393,7 @@ describe("DNS Validated Certificate Handler", () => {
                     Type: "A",
                     AliasTarget: {
                       HostedZoneId: testLBHostedZone,
-                      DNSName: testLoadBalancerDNS,
+                      DNSName: testAccessDNS,
                       EvaluateTargetHealth: true,
                     },
                   },
@@ -403,6 +403,48 @@ describe("DNS Validated Certificate Handler", () => {
             HostedZoneId: testHostedZoneId,
           })
         );
+        expect(request.isDone()).toBe(true);
+      });
+  });
+
+  test("Ignore error if trying to delete an A-record that does not exist", () => {
+    const changeResourceRecordSetsFake = sinon.fake.rejects(new Error("InvalidChangeBatch: [Tried to delete resource record set [name='v1.foobar.com.', type='A'] but it was not found]"));
+
+    const listHostedZonesByNameFake = sinon.fake.resolves({
+      HostedZones: [
+        {
+          Id: `/hostedzone/${testHostedZoneId}`,
+        },
+      ],
+    });
+
+    AWS.mock(
+      "Route53",
+      "changeResourceRecordSets",
+      changeResourceRecordSetsFake
+    );
+    AWS.mock("Route53", "listHostedZonesByName", listHostedZonesByNameFake);
+
+    const request = nock(ResponseURL)
+      .put("/", (body) => {
+        return body.Status === "SUCCESS";
+      })
+      .reply(200);
+    return LambdaTester(handler.handler)
+      .event({
+        RequestType: "Delete",
+        ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          Aliases: testAliases,
+          Region: "us-east-1",
+          PublicAccessDNS: testAccessDNS,
+          PublicAccessHostedZone: testLBHostedZone,
+          AppDNSRole: testRootDNSRole,
+        },
+      })
+      .expectResolve(() => {
         expect(request.isDone()).toBe(true);
       });
   });

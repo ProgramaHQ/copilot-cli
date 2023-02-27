@@ -1,5 +1,5 @@
 # svc deploy
-```bash
+```console
 $ copilot svc deploy
 ```
 
@@ -12,12 +12,12 @@ Service デプロイの手順は以下の通りです。
 1. ローカルの Dockerfile をビルドしてコンテナイメージを作成
 2. `--tag` の値、または最新の git sha (git ディレクトリで作業している場合) を利用してタグ付け
 3. コンテナイメージを ECR にプッシュ
-4. Manifest ファイルとアドオンを CloudFormation にパッケージ
+4. Manifest ファイルと Addon を CloudFormation にパッケージ
 5. ECS タスク定義とサービスを作成 / 更新
 
 ## フラグ
 
-```bash
+```
   -a, --app string                     Name of the application.
   -e, --env string                     Name of the environment.
       --force                          Optional. Force a new service deployment using the existing image.

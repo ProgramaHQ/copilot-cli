@@ -4,9 +4,11 @@
 package stack
 
 import (
-	"errors"
+	"encoding/json"
 	"fmt"
 	"strconv"
+
+	"github.com/aws/copilot-cli/internal/pkg/aws/s3"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
@@ -16,11 +18,6 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/aws/copilot-cli/internal/pkg/template/override"
-)
-
-// Template rendering configuration common across workloads.
-const (
-	wkldParamsTemplatePath = "workloads/params.json.tmpl"
 )
 
 // Parameter logical IDs common across workloads.
@@ -40,6 +37,15 @@ const (
 	WorkloadTaskCountParamKey    = "TaskCount"
 	WorkloadLogRetentionParamKey = "LogRetention"
 	WorkloadEnvFileARNParamKey   = "EnvFileARN"
+)
+
+// Parameter logical IDs for workloads on ECS with a Load Balancer.
+const (
+	WorkloadTargetContainerParamKey = "TargetContainer"
+	WorkloadTargetPortParamKey      = "TargetPort"
+	WorkloadHTTPSParamKey           = "HTTPSEnabled"
+	WorkloadRulePathParamKey        = "RulePath"
+	WorkloadStickinessParamKey      = "Stickiness"
 )
 
 // Parameter logical IDs for workloads on App Runner.
@@ -62,15 +68,27 @@ const (
 // RuntimeConfig represents configuration that's defined outside of the manifest file
 // that is needed to create a CloudFormation stack.
 type RuntimeConfig struct {
-	Image             *ECRImage         // Optional. Image location in an ECR repository.
-	AddonsTemplateURL string            // Optional. S3 object URL for the addons template.
-	EnvFileARN        string            // Optional. S3 object ARN for the env file.
-	AdditionalTags    map[string]string // AdditionalTags are labels applied to resources in the workload stack.
+	Images             map[string]ECRImage // Optional. Image location in an ECR repository.
+	AddonsTemplateURL  string              // Optional. S3 object URL for the addons template.
+	EnvFileARN         string              // Optional. S3 object ARN for the env file.
+	AdditionalTags     map[string]string   // AdditionalTags are labels applied to resources in the workload stack.
+	CustomResourcesURL map[string]string   // Mapping of Custom Resource Function Name to the S3 URL where the function zip file is stored.
 
 	// The target environment metadata.
 	ServiceDiscoveryEndpoint string // Endpoint for the service discovery namespace in the environment.
 	AccountID                string
 	Region                   string
+	EnvVersion               string
+}
+
+func (cfg *RuntimeConfig) loadCustomResourceURLs(bucket string, crs []uploadable) {
+	if len(cfg.CustomResourcesURL) != 0 {
+		return
+	}
+	cfg.CustomResourcesURL = make(map[string]string, len(crs))
+	for _, cr := range crs {
+		cfg.CustomResourcesURL[cr.Name()] = s3.URL(cfg.Region, bucket, cr.ArtifactPath())
+	}
 }
 
 // ECRImage represents configuration about the pushed ECR image that is needed to
@@ -95,7 +113,8 @@ func (i ECRImage) GetLocation() string {
 	return fmt.Sprintf("%s:%s", i.RepoURL, "latest")
 }
 
-type addons interface {
+// NestedStackConfigurer configures a nested stack that deploys addons.
+type NestedStackConfigurer interface {
 	Template() (string, error)
 	Parameters() (string, error)
 }
@@ -104,17 +123,26 @@ type location interface {
 	GetLocation() string
 }
 
+// uploadable is the interface for an object that can be uploaded to an S3 bucket.
+type uploadable interface {
+	Name() string
+	ArtifactPath() string
+}
+
 // wkld represents a generic containerized workload.
 // A workload can be a long-running service, an ephemeral task, or a periodic task.
 type wkld struct {
-	name  string
-	env   string
-	app   string
-	rc    RuntimeConfig
-	image location
+	name               string
+	env                string
+	app                string
+	permBound          string
+	artifactBucketName string
+	rc                 RuntimeConfig
+	image              location
+	rawManifest        []byte // Content of the manifest file without any transformations.
 
 	parser template.Parser
-	addons addons
+	addons NestedStackConfigurer
 }
 
 // StackName returns the name of the stack.
@@ -128,8 +156,8 @@ func (w *wkld) Parameters() ([]*cloudformation.Parameter, error) {
 	if w.image != nil {
 		img = w.image.GetLocation()
 	}
-	if w.rc.Image != nil {
-		img = w.rc.Image.GetLocation()
+	if w.rc.Images != nil {
+		img = w.rc.Images[w.name].GetLocation()
 	}
 	return []*cloudformation.Parameter{
 		{
@@ -169,37 +197,51 @@ type templateConfigurer interface {
 	Tags() []*cloudformation.Tag
 }
 
-func (w *wkld) templateConfiguration(tc templateConfigurer) (string, error) {
-	params, err := tc.Parameters()
+func serializeTemplateConfig(parser template.Parser, stack templateConfigurer) (string, error) {
+	params, err := stack.Parameters()
 	if err != nil {
 		return "", err
 	}
-	doc, err := w.parser.Parse(wkldParamsTemplatePath, struct {
-		Parameters []*cloudformation.Parameter
-		Tags       []*cloudformation.Tag
+
+	tags := stack.Tags()
+
+	config := struct {
+		Parameters map[string]*string `json:"Parameters"`
+		Tags       map[string]*string `json:"Tags,omitempty"`
 	}{
-		Parameters: params,
-		Tags:       tc.Tags(),
-	}, template.WithFuncs(map[string]interface{}{
-		"inc": template.IncFunc,
-	}))
-	if err != nil {
-		return "", err
+		Parameters: make(map[string]*string, len(params)),
+		Tags:       make(map[string]*string, len(tags)),
 	}
-	return doc.String(), nil
+
+	for _, param := range params {
+		config.Parameters[aws.StringValue(param.ParameterKey)] = param.ParameterValue
+	}
+	for _, tag := range tags {
+		config.Tags[aws.StringValue(tag.Key)] = tag.Value
+	}
+
+	str, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal stack parameters to JSON: %v", err)
+	}
+
+	return string(str), nil
 }
 
 func (w *wkld) addonsOutputs() (*template.WorkloadNestedStackOpts, error) {
-	stack, err := w.addons.Template()
-	if err != nil {
-		var notFoundErr *addon.ErrAddonsNotFound
-		if !errors.As(err, &notFoundErr) {
-			return nil, fmt.Errorf("generate addons template for %s: %w", w.name, err)
-		}
-		return nil, nil // No addons found, so there are no outputs and error.
+	if w.addons == nil {
+		return nil, nil
 	}
 
-	out, err := addon.Outputs(stack)
+	tmpl, err := w.addons.Template()
+	switch {
+	case err != nil:
+		return nil, fmt.Errorf("generate addons template for %s: %w", w.name, err)
+	case tmpl == "":
+		return nil, nil
+	}
+
+	out, err := addon.Outputs(tmpl)
 	if err != nil {
 		return nil, fmt.Errorf("get addons outputs for %s: %w", w.name, err)
 	}
@@ -213,13 +255,13 @@ func (w *wkld) addonsOutputs() (*template.WorkloadNestedStackOpts, error) {
 }
 
 func (w *wkld) addonsParameters() (string, error) {
+	if w.addons == nil {
+		return "", nil
+	}
+
 	params, err := w.addons.Parameters()
 	if err != nil {
-		var notFoundErr *addon.ErrAddonsNotFound
-		if !errors.As(err, &notFoundErr) {
-			return "", fmt.Errorf("parse addons parameters for %s: %w", w.name, err)
-		}
-		return "", nil
+		return "", fmt.Errorf("parse addons parameters for %s: %w", w.name, err)
 	}
 	return params, nil
 }
@@ -324,8 +366,8 @@ func (w *appRunnerWkld) Parameters() ([]*cloudformation.Parameter, error) {
 	if w.image != nil {
 		img = w.image.GetLocation()
 	}
-	if w.rc.Image != nil {
-		img = w.rc.Image.GetLocation()
+	if w.rc.Images != nil {
+		img = w.rc.Images[w.name].GetLocation()
 	}
 
 	imageRepositoryType, err := apprunner.DetermineImageRepositoryType(img)
@@ -373,34 +415,34 @@ func (w *appRunnerWkld) Parameters() ([]*cloudformation.Parameter, error) {
 	}
 
 	// Optional HealthCheckInterval parameter
-	if w.healthCheckConfig.HealthCheckArgs.Interval != nil {
+	if w.healthCheckConfig.Advanced.Interval != nil {
 		appRunnerParameters = append(appRunnerParameters, &cloudformation.Parameter{
 			ParameterKey:   aws.String(RDWkldHealthCheckIntervalParamKey),
-			ParameterValue: aws.String(strconv.Itoa(int(w.healthCheckConfig.HealthCheckArgs.Interval.Seconds()))),
+			ParameterValue: aws.String(strconv.Itoa(int(w.healthCheckConfig.Advanced.Interval.Seconds()))),
 		})
 	}
 
 	// Optional HealthCheckTimeout parameter
-	if w.healthCheckConfig.HealthCheckArgs.Timeout != nil {
+	if w.healthCheckConfig.Advanced.Timeout != nil {
 		appRunnerParameters = append(appRunnerParameters, &cloudformation.Parameter{
 			ParameterKey:   aws.String(RDWkldHealthCheckTimeoutParamKey),
-			ParameterValue: aws.String(strconv.Itoa(int(w.healthCheckConfig.HealthCheckArgs.Timeout.Seconds()))),
+			ParameterValue: aws.String(strconv.Itoa(int(w.healthCheckConfig.Advanced.Timeout.Seconds()))),
 		})
 	}
 
 	// Optional HealthCheckHealthyThreshold parameter
-	if w.healthCheckConfig.HealthCheckArgs.HealthyThreshold != nil {
+	if w.healthCheckConfig.Advanced.HealthyThreshold != nil {
 		appRunnerParameters = append(appRunnerParameters, &cloudformation.Parameter{
 			ParameterKey:   aws.String(RDWkldHealthCheckHealthyThresholdParamKey),
-			ParameterValue: aws.String(strconv.Itoa(int(*w.healthCheckConfig.HealthCheckArgs.HealthyThreshold))),
+			ParameterValue: aws.String(strconv.Itoa(int(*w.healthCheckConfig.Advanced.HealthyThreshold))),
 		})
 	}
 
 	// Optional HealthCheckUnhealthyThreshold parameter
-	if w.healthCheckConfig.HealthCheckArgs.UnhealthyThreshold != nil {
+	if w.healthCheckConfig.Advanced.UnhealthyThreshold != nil {
 		appRunnerParameters = append(appRunnerParameters, &cloudformation.Parameter{
 			ParameterKey:   aws.String(RDWkldHealthCheckUnhealthyThresholdParamKey),
-			ParameterValue: aws.String(strconv.Itoa(int(*w.healthCheckConfig.HealthCheckArgs.UnhealthyThreshold))),
+			ParameterValue: aws.String(strconv.Itoa(int(*w.healthCheckConfig.Advanced.UnhealthyThreshold))),
 		})
 	}
 

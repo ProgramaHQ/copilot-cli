@@ -5,7 +5,7 @@ AWSTemplateFormatVersion: '2010-09-09'{{$accounts := .Accounts}}{{$app := .App}}
 # to support the CodePipeline for a workspace
 Description: Cross-regional resources to support the CodePipeline for a workspace
 Metadata:
-  TemplateVersion: 'v1.0.2'
+  TemplateVersion: 'v1.1.0'
   Version: {{.Version}}
   Services:{{if not $services}} []{{else}}{{range $service := $services}}
   - {{$service}}{{end}}{{end}}
@@ -13,13 +13,15 @@ Metadata:
   - {{$account}}{{end}}{{end}}
 Resources:
   KMSKey:
+    Metadata:
+      'aws:copilot:description': 'KMS key to encrypt pipeline artifacts between stages'
     # Used by the CodePipeline in the tools account to en/decrypt the
     # artifacts between stages
     Type: AWS::KMS::Key
     Properties:
       EnableKeyRotation: true
       KeyPolicy:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Id: !Ref AWS::StackName
         Statement:
           -
@@ -58,11 +60,14 @@ Resources:
               - kms:DescribeKey
             Resource: "*"
   PipelineBuiltArtifactBucketPolicy:
+    Metadata:
+      'aws:copilot:description': 'S3 Bucket to store local artifacts'
     Type: AWS::S3::BucketPolicy
     DependsOn: PipelineBuiltArtifactBucket
     Properties:
       Bucket: !Ref PipelineBuiltArtifactBucket
       PolicyDocument:
+        Version: '2012-10-17'
         Statement:
           -
             Action:
@@ -84,9 +89,14 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
 
 {{range $service := $services}}
   ECRRepo{{logicalIDSafe $service}}:
+    Metadata:
+      'aws:copilot:description': 'ECR container image repository for "{{$service}}"'
     Type: AWS::ECR::Repository
     Properties:
       RepositoryName: {{$app}}/{{$service}}
@@ -95,7 +105,7 @@ Resources:
           Key: {{$svcTag}}
           Value: {{$service}}
       RepositoryPolicyText:
-        Version: '2008-10-17'
+        Version: '2012-10-17'
         Statement:
         - Sid: AllowPushPull
           Effect: Allow
@@ -119,7 +129,7 @@ Outputs:
     Export:
       Name: {{$app}}-ArtifactKey
   PipelineBucket:
-    Description: Bucket used for CodePipeline to stage resources in.
+    Description: "A bucket used for any Copilot artifacts that must be stored in S3 (pipelines, env files, etc)."
     Value: !Ref PipelineBuiltArtifactBucket
 {{- range $service := $services}} 
   ECRRepo{{logicalIDSafe $service}}:

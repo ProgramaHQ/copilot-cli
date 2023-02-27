@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/aws/copilot-cli/e2e/internal/client"
@@ -18,7 +18,7 @@ import (
 var _ = Describe("App With Domain", func() {
 	const domainName = "copilot-e2e-tests.ecs.aws.dev"
 
-	Context("when creating a new app", func() {
+	Context("when creating a new app", Ordered, func() {
 		var appInitErr error
 
 		BeforeAll(func() {
@@ -48,10 +48,10 @@ var _ = Describe("App With Domain", func() {
 		})
 	})
 
-	Context("when creating new environments", func() {
+	Context("when adding new environments", func() {
 		fatalErrors := make(chan error)
 		wgDone := make(chan bool)
-		It("env init should succeed for creating test and prod environments", func() {
+		It("env init should succeed for adding test and prod environments", func() {
 			var wg sync.WaitGroup
 			wg.Add(2)
 			go func() {
@@ -61,7 +61,6 @@ var _ = Describe("App With Domain", func() {
 						AppName: appName,
 						EnvName: "test",
 						Profile: "default",
-						Prod:    false,
 					})
 					if err == nil {
 						break
@@ -79,7 +78,6 @@ var _ = Describe("App With Domain", func() {
 						AppName: appName,
 						EnvName: "prod",
 						Profile: prodEnvironmentProfile,
-						Prod:    false,
 					})
 					if err == nil {
 						break
@@ -88,6 +86,46 @@ var _ = Describe("App With Domain", func() {
 						fatalErrors <- err
 					}
 					time.Sleep(waitingInterval)
+				}
+			}()
+			go func() {
+				wg.Wait()
+				close(wgDone)
+				close(fatalErrors)
+			}()
+
+			select {
+			case <-wgDone:
+			case err := <-fatalErrors:
+				Expect(err).NotTo(HaveOccurred())
+			}
+		})
+	})
+
+	Context("when deploying the environments", func() {
+		fatalErrors := make(chan error)
+		wgDone := make(chan bool)
+		It("env deploy should succeed for deploying test and prod environments", func() {
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_, err := cli.EnvDeploy(&client.EnvDeployRequest{
+					AppName: appName,
+					Name:    "test",
+				})
+				if err != nil {
+					fatalErrors <- err
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				_, err := cli.EnvDeploy(&client.EnvDeployRequest{
+					AppName: appName,
+					Name:    "prod",
+				})
+				if err != nil {
+					fatalErrors <- err
 				}
 			}()
 			go func() {
@@ -240,7 +278,7 @@ var _ = Describe("App With Domain", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(svc.Routes)).To(Equal(1))
 			wantedURLs = map[string]string{
-				"test": "https://frontend.copilot-e2e-tests.ecs.aws.dev or https://copilot-e2e-tests.ecs.aws.dev",
+				"test": "https://copilot-e2e-tests.ecs.aws.dev or https://frontend.copilot-e2e-tests.ecs.aws.dev",
 			}
 			// Validate route has the expected HTTPS endpoint.
 			route := svc.Routes[0]

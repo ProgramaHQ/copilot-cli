@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -40,6 +41,11 @@ const (
 	envControllerResourceType = "Custom::EnvControllerFunction"
 )
 
+// CloudFormation's error types to compare against.
+var (
+	errNotFound *cloudformation.ErrStackNotFound
+)
+
 // StackConfiguration represents the set of methods needed to deploy a cloudformation stack.
 type StackConfiguration interface {
 	StackName() string
@@ -47,6 +53,38 @@ type StackConfiguration interface {
 	Parameters() ([]*sdkcloudformation.Parameter, error)
 	Tags() []*sdkcloudformation.Tag
 	SerializedParameters() (string, error)
+}
+
+// An Overrider transforms the content in body to out.
+type Overrider interface {
+	Override(body []byte) (out []byte, err error)
+}
+
+// overridableStack is a StackConfiguration with overrides applied.
+type overridableStack struct {
+	StackConfiguration
+	overrider Overrider
+}
+
+// Template returns the overriden CloudFormation stack template.
+func (s *overridableStack) Template() (string, error) {
+	tpl, err := s.StackConfiguration.Template()
+	if err != nil {
+		return "", fmt.Errorf("generate stack template: %w", err)
+	}
+	out, err := s.overrider.Override([]byte(tpl))
+	if err != nil {
+		return "", fmt.Errorf("override template: %w", err)
+	}
+	return string(out), nil
+}
+
+// WrapWithTemplateOverrider returns a wrapped stack, such that Template calls returns an overriden stack template.
+func WrapWithTemplateOverrider(stack StackConfiguration, overrider Overrider) StackConfiguration {
+	return &overridableStack{
+		StackConfiguration: stack,
+		overrider:          overrider,
+	}
 }
 
 type ecsClient interface {
@@ -73,6 +111,7 @@ type cfnClient interface {
 	ErrorEvents(stackName string) ([]cloudformation.StackEvent, error)
 	Outputs(stack *cloudformation.Stack) (map[string]string, error)
 	StackResources(name string) ([]*cloudformation.StackResource, error)
+	Metadata(opts cloudformation.MetadataOpts) (string, error)
 
 	// Methods vended by the aws sdk struct.
 	DescribeStackEvents(*sdkcloudformation.DescribeStackEventsInput) (*sdkcloudformation.DescribeStackEventsOutput, error)
@@ -92,12 +131,39 @@ type s3Client interface {
 
 type stackSetClient interface {
 	Create(name, template string, opts ...stackset.CreateOrUpdateOption) error
+	CreateInstances(name string, accounts, regions []string) (string, error)
 	CreateInstancesAndWait(name string, accounts, regions []string) error
+	Update(name, template string, opts ...stackset.CreateOrUpdateOption) (string, error)
 	UpdateAndWait(name, template string, opts ...stackset.CreateOrUpdateOption) error
 	Describe(name string) (stackset.Description, error)
+	DescribeOperation(name, opID string) (stackset.Operation, error)
 	InstanceSummaries(name string, opts ...stackset.InstanceSummariesOption) ([]stackset.InstanceSummary, error)
+	DeleteAllInstances(name string) (string, error)
 	Delete(name string) error
 	WaitForStackSetLastOperationComplete(name string) error
+	WaitForOperation(name, opID string) error
+}
+
+// OptFn represents an optional configuration function for the CloudFormation client.
+type OptFn func(cfn *CloudFormation)
+
+// WithProgressTracker updates the CloudFormation client to write stack updates to a file.
+func WithProgressTracker(fw progress.FileWriter) OptFn {
+	return func(cfn *CloudFormation) {
+		cfn.console = fw
+	}
+}
+
+// discardFile represents a fake file where all Writes succeeds and are not written anywhere.
+type discardFile struct{}
+
+// Write implements the io.Writer interface and discards p.
+func (f *discardFile) Write(p []byte) (n int, err error) { return io.Discard.Write(p) }
+
+// Fd returns stderr as the file descriptor.
+// The file descriptor value shouldn't matter as long as it's a valid value as all writes are gone to io.Discard.
+func (f *discardFile) Fd() uintptr {
+	return os.Stderr.Fd()
 }
 
 // CloudFormation wraps the CloudFormationAPI interface
@@ -110,10 +176,17 @@ type CloudFormation struct {
 	appStackSet    stackSetClient
 	s3Client       s3Client
 	region         string
+	console        progress.FileWriter
+
+	// cached variables.
+	cachedDeployedStack *cloudformation.StackDescription
+
+	// Overriden in tests.
+	renderStackSet func(input renderStackSetInput) error
 }
 
 // New returns a configured CloudFormation client.
-func New(sess *session.Session) CloudFormation {
+func New(sess *session.Session, opts ...OptFn) CloudFormation {
 	client := CloudFormation{
 		cfnClient:      cloudformation.New(sess),
 		codeStarClient: codestar.New(sess),
@@ -127,8 +200,23 @@ func New(sess *session.Session) CloudFormation {
 		appStackSet: stackset.New(sess),
 		s3Client:    s3.New(sess),
 		region:      aws.StringValue(sess.Config.Region),
+		console:     new(discardFile),
 	}
+	for _, opt := range opts {
+		opt(&client)
+	}
+	client.renderStackSet = client.renderStackSetImpl
 	return client
+}
+
+// IsEmptyErr returns true if the error occurred because the cloudformation resource does not exist or does not contain any sub-resources.
+func IsEmptyErr(err error) bool {
+	type isEmpty interface {
+		IsEmpty() bool
+	}
+
+	var emptyErr isEmpty
+	return errors.As(err, &emptyErr)
 }
 
 // errorEvents returns the list of status reasons of failed resource events
@@ -145,16 +233,36 @@ func (cf CloudFormation) errorEvents(stackName string) ([]string, error) {
 	return reasons, nil
 }
 
-type renderStackChangesInput struct {
-	w                progress.FileWriter
+type executeAndRenderChangeSetInput struct {
 	stackName        string
 	stackDescription string
 	createChangeSet  func() (string, error)
 }
 
-func (cf CloudFormation) newRenderWorkloadInput(w progress.FileWriter, stack *cloudformation.Stack) *renderStackChangesInput {
-	in := &renderStackChangesInput{
-		w:                w,
+func (cf CloudFormation) newCreateChangeSetInput(w progress.FileWriter, stack *cloudformation.Stack) *executeAndRenderChangeSetInput {
+	in := &executeAndRenderChangeSetInput{
+		stackName:        stack.Name,
+		stackDescription: fmt.Sprintf("Creating the infrastructure for stack %s", stack.Name),
+	}
+	in.createChangeSet = func() (string, error) {
+		spinner := progress.NewSpinner(w)
+		label := fmt.Sprintf("Proposing infrastructure changes for stack %s", stack.Name)
+		spinner.Start(label)
+
+		var errAlreadyExists *cloudformation.ErrStackAlreadyExists
+		changeSetID, err := cf.cfnClient.Create(stack)
+		if err != nil && !errors.As(err, &errAlreadyExists) {
+			spinner.Stop(log.Serrorf("%s\n", label))
+			return "", cf.handleStackError(stack.Name, err)
+		}
+		spinner.Stop(log.Ssuccessf("%s\n", label))
+		return changeSetID, err
+	}
+	return in
+}
+
+func (cf CloudFormation) newUpsertChangeSetInput(w progress.FileWriter, stack *cloudformation.Stack) *executeAndRenderChangeSetInput {
+	in := &executeAndRenderChangeSetInput{
 		stackName:        stack.Name,
 		stackDescription: fmt.Sprintf("Creating the infrastructure for stack %s", stack.Name),
 	}
@@ -194,10 +302,13 @@ func (cf CloudFormation) newRenderWorkloadInput(w progress.FileWriter, stack *cl
 	return in
 }
 
-func (cf CloudFormation) renderStackChanges(in *renderStackChangesInput) error {
+func (cf CloudFormation) executeAndRenderChangeSet(in *executeAndRenderChangeSetInput) error {
 	changeSetID, err := in.createChangeSet()
 	if err != nil {
 		return err
+	}
+	if _, ok := cf.console.(*discardFile); ok { // If we don't have to render skip the additional network calls.
+		return nil
 	}
 	waitCtx, cancelWait := context.WithTimeout(context.Background(), waitForStackTimeout)
 	defer cancelWait()
@@ -208,7 +319,8 @@ func (cf CloudFormation) renderStackChanges(in *renderStackChangesInput) error {
 		return err
 	}
 	g.Go(func() error {
-		return progress.Render(ctx, progress.NewTabbedFileWriter(in.w), renderer)
+		_, err := progress.Render(ctx, progress.NewTabbedFileWriter(cf.console), renderer)
+		return err
 	})
 	if err := g.Wait(); err != nil {
 		return err
@@ -367,13 +479,87 @@ func (cf CloudFormation) createEnvControllerRenderer(in *envControllerRendererIn
 	}), nil
 }
 
+type renderStackInput struct {
+	group *errgroup.Group // Group of go routines.
+
+	// Stack metadata.
+	stackName      string            // Name of the stack.
+	stackID        string            // ID of the stack.
+	description    string            // Descriptive text for the stack mutation.
+	descriptionFor map[string]string // Descriptive text for each resource in the stack.
+	startTime      time.Time         // Timestamp for when the stack mutation started.
+}
+
+func (cf CloudFormation) stackRenderer(ctx context.Context, in renderStackInput) progress.DynamicRenderer {
+	streamer := stream.NewStackStreamer(cf.cfnClient, in.stackID, in.startTime)
+	renderer := progress.ListeningStackRenderer(streamer, in.stackName, in.description, in.descriptionFor, progress.RenderOptions{})
+	in.group.Go(func() error {
+		return stream.Stream(ctx, streamer)
+	})
+	return renderer
+}
+
+func (cf CloudFormation) deleteAndRenderStack(name, description string, deleteFn func() error) error {
+	body, err := cf.cfnClient.TemplateBody(name)
+	if err != nil {
+		if !errors.As(err, &errNotFound) {
+			return fmt.Errorf("get template body of stack %q: %w", name, err)
+		}
+		return nil // stack already deleted.
+	}
+	descriptionFor, err := cloudformation.ParseTemplateDescriptions(body)
+	if err != nil {
+		return fmt.Errorf("parse resource descriptions in template of stack %q: %w", name, err)
+	}
+
+	stack, err := cf.cfnClient.Describe(name)
+	if err != nil {
+		if !errors.As(err, &errNotFound) {
+			return fmt.Errorf("retrieve the stack ID for stack %q: %w", name, err)
+		}
+		return nil // stack already deleted.
+	}
+
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), waitForStackTimeout)
+	defer cancelWait()
+	g, ctx := errgroup.WithContext(waitCtx)
+	now := time.Now()
+	g.Go(deleteFn)
+	renderer := cf.stackRenderer(ctx, renderStackInput{
+		group:          g,
+		stackID:        aws.StringValue(stack.StackId),
+		stackName:      name,
+		description:    description,
+		descriptionFor: descriptionFor,
+		startTime:      now,
+	})
+	g.Go(func() error {
+		w := progress.NewTabbedFileWriter(cf.console)
+		nl, err := progress.Render(ctx, w, renderer)
+		if err != nil {
+			return fmt.Errorf("render stack %q progress: %w", name, err)
+		}
+		_, err = progress.EraseAndRender(w, progress.LineRenderer(log.Ssuccess(description), 0), nl)
+		if err != nil {
+			return fmt.Errorf("erase and render stack %q progress: %w", name, err)
+		}
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		if !errors.As(err, &errNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (cf CloudFormation) errOnFailedStack(stackName string) error {
 	stack, err := cf.cfnClient.Describe(stackName)
 	if err != nil {
 		return err
 	}
 	status := aws.StringValue(stack.StackStatus)
-	if cloudformation.StackStatus(status).Failure() {
+	if cloudformation.StackStatus(status).IsFailure() {
 		return fmt.Errorf("stack %s did not complete successfully and exited with status %s", stackName, status)
 	}
 	return nil

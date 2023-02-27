@@ -10,6 +10,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
+	"github.com/spf13/afero"
 
 	"github.com/aws/copilot-cli/internal/pkg/exec"
 
@@ -53,21 +55,21 @@ func newDeployOpts(vars deployWkldVars) (*deployOpts, error) {
 		return nil, fmt.Errorf("default session: %v", err)
 	}
 	store := config.NewSSMStore(identity.New(defaultSess), ssm.New(defaultSess), aws.StringValue(defaultSess.Config.Region))
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new workspace: %w", err)
+		return nil, err
 	}
 	prompter := prompt.New()
 	return &deployOpts{
 		deployWkldVars: vars,
 		store:          store,
-		sel:            selector.NewWorkspaceSelect(prompter, store, ws),
+		sel:            selector.NewLocalWorkloadSelector(prompter, store, ws),
 		ws:             ws,
 		prompt:         prompter,
 
 		setupDeployCmd: func(o *deployOpts, workloadType string) {
 			switch {
-			case contains(workloadType, manifest.JobTypes()):
+			case contains(workloadType, manifestinfo.JobTypes()):
 				opts := &deployJobOpts{
 					deployWkldVars: o.deployWkldVars,
 
@@ -75,7 +77,7 @@ func newDeployOpts(vars deployWkldVars) (*deployOpts, error) {
 					ws:              o.ws,
 					newInterpolator: newManifestInterpolator,
 					unmarshal:       manifest.UnmarshalWorkload,
-					sel:             selector.NewWorkspaceSelect(o.prompt, o.store, o.ws),
+					sel:             selector.NewLocalWorkloadSelector(o.prompt, o.store, ws),
 					cmd:             exec.NewCmd(),
 					sessProvider:    sessProvider,
 				}
@@ -83,7 +85,7 @@ func newDeployOpts(vars deployWkldVars) (*deployOpts, error) {
 					return newJobDeployer(opts)
 				}
 				o.deployWkld = opts
-			case contains(workloadType, manifest.ServiceTypes()):
+			case contains(workloadType, manifestinfo.ServiceTypes()):
 				opts := &deploySvcOpts{
 					deployWkldVars: o.deployWkldVars,
 
@@ -92,7 +94,7 @@ func newDeployOpts(vars deployWkldVars) (*deployOpts, error) {
 					newInterpolator: newManifestInterpolator,
 					unmarshal:       manifest.UnmarshalWorkload,
 					spinner:         termprogress.NewSpinner(log.DiagnosticWriter),
-					sel:             selector.NewWorkspaceSelect(o.prompt, o.store, o.ws),
+					sel:             selector.NewLocalWorkloadSelector(o.prompt, o.store, ws),
 					prompt:          o.prompt,
 					cmd:             exec.NewCmd(),
 					sessProvider:    sessProvider,

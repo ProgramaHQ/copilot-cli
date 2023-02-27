@@ -9,6 +9,7 @@ import (
 
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
+	"github.com/spf13/afero"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
@@ -59,9 +60,9 @@ type showPipelineOpts struct {
 }
 
 func newShowPipelineOpts(vars showPipelineVars) (*showPipelineOpts, error) {
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new workspace client: %w", err)
+		return nil, err
 	}
 
 	defaultSession, err := sessions.ImmutableProvider(sessions.UserAgentExtras("pipeline show")).Default()
@@ -78,7 +79,7 @@ func newShowPipelineOpts(vars showPipelineVars) (*showPipelineOpts, error) {
 		store:                  store,
 		codepipeline:           codepipeline,
 		deployedPipelineLister: pipelineLister,
-		sel:                    selector.NewAppPipelineSelect(prompter, store, pipelineLister),
+		sel:                    selector.NewAppPipelineSelector(prompter, store, pipelineLister),
 		prompt:                 prompter,
 		w:                      log.OutputWriter,
 	}

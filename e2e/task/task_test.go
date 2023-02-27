@@ -5,12 +5,12 @@ package task
 
 import (
 	"github.com/aws/copilot-cli/e2e/internal/client"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("Task", func() {
-	Context("when creating a new app", func() {
+	Context("when creating a new app", Ordered, func() {
 		var err error
 		BeforeAll(func() {
 			_, err = cli.AppInit(&client.AppInitRequest{
@@ -23,7 +23,7 @@ var _ = Describe("Task", func() {
 		})
 	})
 
-	Context("when creating a new environment", func() {
+	Context("when adding a new environment", Ordered, func() {
 		var (
 			err error
 		)
@@ -32,7 +32,6 @@ var _ = Describe("Task", func() {
 				AppName: appName,
 				EnvName: envName,
 				Profile: "default",
-				Prod:    false,
 			})
 		})
 
@@ -41,7 +40,21 @@ var _ = Describe("Task", func() {
 		})
 	})
 
-	Context("when running in an environment", func() {
+	Context("when deploying the environment", Ordered, func() {
+		var envDeployErr error
+		BeforeAll(func() {
+			_, envDeployErr = cli.EnvDeploy(&client.EnvDeployRequest{
+				AppName: appName,
+				Name:    envName,
+			})
+		})
+
+		It("should succeed", func() {
+			Expect(envDeployErr).NotTo(HaveOccurred())
+		})
+	})
+
+	Context("when running in an environment", Ordered, func() {
 		var err error
 		BeforeAll(func() {
 			_, err = cli.TaskRun(&client.TaskRunInput{
@@ -59,7 +72,7 @@ var _ = Describe("Task", func() {
 		})
 	})
 
-	Context("when running in default cluster and subnets", func() {
+	Context("when running in default cluster and subnets", Ordered, func() {
 		var err error
 		var taskLogs string
 		BeforeAll(func() {
@@ -92,7 +105,7 @@ var _ = Describe("Task", func() {
 		})
 	})
 
-	Context("when running with command and environment variables", func() {
+	Context("when running with command and environment variables", Ordered, func() {
 		var err error
 		var taskLogs string
 		BeforeAll(func() {

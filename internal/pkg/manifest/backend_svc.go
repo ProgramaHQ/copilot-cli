@@ -5,6 +5,7 @@ package manifest
 
 import (
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/imdario/mergo"
 )
@@ -19,20 +20,22 @@ type BackendService struct {
 	BackendServiceConfig `yaml:",inline"`
 	// Use *BackendServiceConfig because of https://github.com/imdario/mergo/issues/146
 	Environments map[string]*BackendServiceConfig `yaml:",flow"`
-
-	parser template.Parser
+	parser       template.Parser
 }
 
 // BackendServiceConfig holds the configuration that can be overridden per environments.
 type BackendServiceConfig struct {
 	ImageConfig      ImageWithHealthcheckAndOptionalPort `yaml:"image,flow"`
 	ImageOverride    `yaml:",inline"`
+	RoutingRule      RoutingRuleConfiguration `yaml:"http,flow"`
 	TaskConfig       `yaml:",inline"`
 	Logging          Logging                   `yaml:"logging,flow"`
 	Sidecars         map[string]*SidecarConfig `yaml:"sidecars"` // NOTE: keep the pointers because `mergo` doesn't automatically deep merge map's value unless it's a pointer type.
 	Network          NetworkConfig             `yaml:"network"`
 	PublishConfig    PublishConfig             `yaml:"publish"`
 	TaskDefOverrides []OverrideRule            `yaml:"taskdef_overrides"`
+	DeployConfig     DeploymentConfig          `yaml:"deployment"`
+	Observability    Observability             `yaml:"observability"`
 }
 
 // BackendServiceProps represents the configuration needed to create a backend service.
@@ -59,6 +62,17 @@ func NewBackendService(props BackendServiceProps) *BackendService {
 		svc.BackendServiceConfig.TaskConfig.Memory = aws.Int(MinWindowsTaskMemory)
 	}
 	svc.parser = template.New()
+	for _, envName := range props.PrivateOnlyEnvironments {
+		svc.Environments[envName] = &BackendServiceConfig{
+			Network: NetworkConfig{
+				VPC: vpcConfig{
+					Placement: PlacementArgOrString{
+						PlacementString: placementStringP(PrivateSubnetPlacement),
+					},
+				},
+			},
+		}
+	}
 	return svc
 }
 
@@ -75,7 +89,17 @@ func (s *BackendService) MarshalBinary() ([]byte, error) {
 	return content.Bytes(), nil
 }
 
-// Port returns the exposed the exposed port in the manifest.
+func (s *BackendService) requiredEnvironmentFeatures() []string {
+	var features []string
+	if !s.RoutingRule.IsEmpty() {
+		features = append(features, template.InternalALBFeatureName)
+	}
+	features = append(features, s.Network.requiredEnvFeatures()...)
+	features = append(features, s.Storage.requiredEnvFeatures()...)
+	return features
+}
+
+// Port returns the exposed port in the manifest.
 // If the backend service is not meant to be reachable, then ok is set to false.
 func (s *BackendService) Port() (port uint16, ok bool) {
 	value := s.BackendServiceConfig.ImageConfig.Port
@@ -87,7 +111,7 @@ func (s *BackendService) Port() (port uint16, ok bool) {
 
 // Publish returns the list of topics where notifications can be published.
 func (s *BackendService) Publish() []Topic {
-	return s.BackendServiceConfig.PublishConfig.Topics
+	return s.BackendServiceConfig.PublishConfig.publishedTopics()
 }
 
 // BuildRequired returns if the service requires building from the local Dockerfile.
@@ -95,9 +119,11 @@ func (s *BackendService) BuildRequired() (bool, error) {
 	return requiresBuild(s.ImageConfig.Image)
 }
 
-// BuildArgs returns a docker.BuildArguments object for the service given a workspace root directory.
-func (s *BackendService) BuildArgs(wsRoot string) *DockerBuildArgs {
-	return s.ImageConfig.Image.BuildConfig(wsRoot)
+// BuildArgs returns a docker.BuildArguments object for the service given a context directory.
+func (s *BackendService) BuildArgs(contextDir string) map[string]*DockerBuildArgs {
+	buildArgs := make(map[string]*DockerBuildArgs, len(s.Sidecars)+1)
+	buildArgs[aws.StringValue(s.Name)] = s.ImageConfig.Image.BuildConfig(contextDir)
+	return buildArgs
 }
 
 // EnvFile returns the location of the env file against the ws root directory.
@@ -105,9 +131,11 @@ func (s *BackendService) EnvFile() string {
 	return aws.StringValue(s.TaskConfig.EnvFile)
 }
 
-// ApplyEnv returns the service manifest with environment overrides.
-// If the environment passed in does not have any overrides then it returns itself.
-func (s BackendService) ApplyEnv(envName string) (WorkloadManifest, error) {
+func (s *BackendService) subnets() *SubnetListOrArgs {
+	return &s.Network.VPC.Placement.Subnets
+}
+
+func (s BackendService) applyEnv(envName string) (workloadManifest, error) {
 	overrideConfig, ok := s.Environments[envName]
 	if !ok {
 		return &s, nil
@@ -134,7 +162,7 @@ func (s BackendService) ApplyEnv(envName string) (WorkloadManifest, error) {
 func newDefaultBackendService() *BackendService {
 	return &BackendService{
 		Workload: Workload{
-			Type: aws.String(BackendServiceType),
+			Type: aws.String(manifestinfo.BackendServiceType),
 		},
 		BackendServiceConfig: BackendServiceConfig{
 			ImageConfig: ImageWithHealthcheckAndOptionalPort{},
@@ -144,7 +172,7 @@ func newDefaultBackendService() *BackendService {
 				Count: Count{
 					Value: aws.Int(1),
 					AdvancedCount: AdvancedCount{ // Leave advanced count empty while passing down the type of the workload.
-						workloadType: BackendServiceType,
+						workloadType: manifestinfo.BackendServiceType,
 					},
 				},
 				ExecuteCommand: ExecuteCommand{
@@ -153,9 +181,33 @@ func newDefaultBackendService() *BackendService {
 			},
 			Network: NetworkConfig{
 				VPC: vpcConfig{
-					Placement: placementP(PublicSubnetPlacement),
+					Placement: PlacementArgOrString{
+						PlacementString: placementStringP(PublicSubnetPlacement),
+					},
 				},
 			},
 		},
+		Environments: map[string]*BackendServiceConfig{},
 	}
+}
+
+// ExposedPorts returns all the ports that are container ports available to receive traffic.
+func (b *BackendService) ExposedPorts() (ExposedPortsIndex, error) {
+	var exposedPorts []ExposedPort
+
+	workloadName := aws.StringValue(b.Name)
+	exposedPorts = append(exposedPorts, b.ImageConfig.exposedPorts(workloadName)...)
+	for name, sidecar := range b.Sidecars {
+		out, err := sidecar.exposedPorts(name)
+		if err != nil {
+			return ExposedPortsIndex{}, err
+		}
+		exposedPorts = append(exposedPorts, out...)
+	}
+	exposedPorts = append(exposedPorts, b.RoutingRule.exposedPorts(exposedPorts, workloadName)...)
+	portsForContainer, containerForPort := prepareParsedExposedPortsMap(sortExposedPorts(exposedPorts))
+	return ExposedPortsIndex{
+		PortsForContainer: portsForContainer,
+		ContainerForPort:  containerForPort,
+	}, nil
 }

@@ -14,7 +14,6 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/aws/codepipeline"
 	"github.com/aws/copilot-cli/internal/pkg/aws/ec2"
 	awsecs "github.com/aws/copilot-cli/internal/pkg/aws/ecs"
-	"github.com/aws/copilot-cli/internal/pkg/aws/s3"
 	"github.com/aws/copilot-cli/internal/pkg/aws/ssm"
 	clideploy "github.com/aws/copilot-cli/internal/pkg/cli/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/config"
@@ -31,7 +30,6 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/repository"
 	"github.com/aws/copilot-cli/internal/pkg/task"
-	termprogress "github.com/aws/copilot-cli/internal/pkg/term/progress"
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"github.com/aws/copilot-cli/internal/pkg/term/selector"
 	"github.com/aws/copilot-cli/internal/pkg/workspace"
@@ -127,6 +125,10 @@ type environmentLister interface {
 	ListEnvironments(appName string) ([]*config.Environment, error)
 }
 
+type wsEnvironmentsLister interface {
+	ListEnvironments() ([]string, error)
+}
+
 type environmentDeleter interface {
 	DeleteEnvironment(appName, environmentName string) error
 }
@@ -180,11 +182,7 @@ type logEventsWriter interface {
 	WriteLogEvents(opts logging.WriteLogEventsOpts) error
 }
 
-type templater interface {
-	Template() (string, error)
-}
-
-type runner interface {
+type execRunner interface {
 	Run(name string, args []string, options ...exec.CmdOption) error
 }
 
@@ -224,6 +222,11 @@ type describer interface {
 	Describe() (describe.HumanJSONStringer, error)
 }
 
+type workloadDescriber interface {
+	describer
+	Manifest(string) ([]byte, error)
+}
+
 type wsFileDeleter interface {
 	DeleteWorkspaceFile() error
 }
@@ -232,18 +235,30 @@ type manifestReader interface {
 	ReadWorkloadManifest(name string) (workspace.WorkloadManifest, error)
 }
 
+type environmentManifestWriter interface {
+	WriteEnvironmentManifest(encoding.BinaryMarshaler, string) (string, error)
+}
+
 type workspacePathGetter interface {
-	Path() (string, error)
+	Path() string
 }
 
 type wsPipelineManifestReader interface {
 	ReadPipelineManifest(path string) (*manifest.Pipeline, error)
 }
 
+type relPath interface {
+	// Rel returns the path relative from the object's root path to the target path.
+	//
+	// Unlike filepath.Rel, the input path is allowed to be either relative to the
+	// current working directory or absolute.
+	Rel(path string) (string, error)
+}
+
 type wsPipelineIniter interface {
+	relPath
 	WritePipelineBuildspec(marshaler encoding.BinaryMarshaler, name string) (string, error)
 	WritePipelineManifest(marshaler encoding.BinaryMarshaler, name string) (string, error)
-	Rel(path string) (string, error)
 	ListPipelines() ([]workspace.PipelineManifest, error)
 }
 
@@ -269,6 +284,24 @@ type wlLister interface {
 	ListWorkloads() ([]string, error)
 }
 
+type wsWorkloadReader interface {
+	manifestReader
+	ReadFile(path string) ([]byte, error)
+	WorkloadExists(name string) (bool, error)
+	WorkloadAddonFilePath(wkldName, fName string) string
+	WorkloadAddonFileAbsPath(wkldName, fName string) string
+}
+
+type wsWorkloadReadWriter interface {
+	wsWorkloadReader
+	wsWriter
+}
+
+type wsReadWriter interface {
+	wsWorkloadReadWriter
+	wsEnvironmentReader
+}
+
 type wsJobDirReader interface {
 	wsJobReader
 	workspacePathGetter
@@ -279,13 +312,23 @@ type wsWlDirReader interface {
 	wsSvcReader
 	workspacePathGetter
 	wlLister
-	ListDockerfiles() ([]string, error)
+	wsEnvironmentsLister
+	WorkloadOverridesPath(string) string
 	Summary() (*workspace.Summary, error)
+}
+
+type wsEnvironmentReader interface {
+	wsEnvironmentsLister
+	HasEnvironments() (bool, error)
+	EnvOverridesPath() string
+	ReadEnvironmentManifest(mftDirName string) (workspace.EnvironmentManifest, error)
+	EnvAddonFilePath(fName string) string
+	EnvAddonFileAbsPath(fName string) string
 }
 
 type wsPipelineReader interface {
 	wsPipelineGetter
-	Rel(path string) (string, error)
+	relPath
 }
 
 type wsPipelineGetter interface {
@@ -295,25 +338,15 @@ type wsPipelineGetter interface {
 }
 
 type wsAppManager interface {
-	Create(appName string) error
 	Summary() (*workspace.Summary, error)
 }
 
-type wsAddonManager interface {
-	WriteAddon(f encoding.BinaryMarshaler, svc, name string) (string, error)
-	manifestReader
-	wlLister
+type wsWriter interface {
+	Write(content encoding.BinaryMarshaler, path string) (string, error)
 }
 
 type uploader interface {
 	Upload(bucket, key string, data io.Reader) (string, error)
-	ZipAndUpload(bucket, key string, files ...s3.NamedBinary) (string, error)
-}
-
-type customResourcesUploader interface {
-	UploadEnvironmentCustomResources(upload s3.CompressAndUploadFunc) (map[string]string, error)
-	UploadRequestDrivenWebServiceCustomResources(upload s3.CompressAndUploadFunc) (map[string]string, error)
-	UploadNetworkLoadBalancedWebServiceCustomResources(upload s3.CompressAndUploadFunc) (map[string]string, error)
 }
 
 type bucketEmptier interface {
@@ -322,7 +355,7 @@ type bucketEmptier interface {
 
 // Interfaces for deploying resources through CloudFormation. Facilitates mocking.
 type environmentDeployer interface {
-	DeployAndRenderEnvironment(out termprogress.FileWriter, env *deploy.CreateEnvironmentInput) error
+	CreateAndRenderEnvironment(conf cloudformation.StackConfiguration, bucketARN string) error
 	DeleteEnvironment(appName, envName, cfnExecRoleARN string) error
 	GetEnvironment(appName, envName string) (*config.Environment, error)
 	EnvironmentTemplate(appName, envName string) (string, error)
@@ -370,7 +403,8 @@ type appResourcesGetter interface {
 }
 
 type taskDeployer interface {
-	DeployTask(out termprogress.FileWriter, input *deploy.CreateTaskResourcesInput, opts ...awscloudformation.StackOption) error
+	DeployTask(input *deploy.CreateTaskResourcesInput, opts ...awscloudformation.StackOption) error
+	GetTaskStack(taskName string) (*deploy.TaskStackInfo, error)
 }
 
 type taskStackManager interface {
@@ -380,6 +414,7 @@ type taskStackManager interface {
 
 type taskRunner interface {
 	Run() ([]*task.Task, error)
+	CheckNonZeroExitCode([]*task.Task) error
 }
 
 type defaultClusterGetter interface {
@@ -395,10 +430,7 @@ type deployer interface {
 
 type domainHostedZoneGetter interface {
 	DomainHostedZoneID(domainName string) (string, error)
-}
-
-type domainInfoGetter interface {
-	IsRegisteredDomain(domainName string) error
+	ValidateDomainOwnership(domainName string) error
 }
 
 type dockerfileParser interface {
@@ -413,28 +445,17 @@ type statusDescriber interface {
 type envDescriber interface {
 	Describe() (*describe.EnvDescription, error)
 	PublicCIDRBlocks() ([]string, error)
+	Manifest() ([]byte, error)
+	ValidateCFServiceDomainAliases() error
+}
+
+type versionCompatibilityChecker interface {
+	versionGetter
+	AvailableFeatures() ([]string, error)
 }
 
 type versionGetter interface {
 	Version() (string, error)
-}
-
-type envTemplater interface {
-	EnvironmentTemplate(appName, envName string) (string, error)
-}
-
-type envUpgrader interface {
-	UpgradeEnvironment(in *deploy.CreateEnvironmentInput) error
-}
-
-type legacyEnvUpgrader interface {
-	UpgradeLegacyEnvironment(in *deploy.CreateEnvironmentInput, lbWebServices ...string) error
-	envTemplater
-}
-
-type envTemplateUpgrader interface {
-	envUpgrader
-	legacyEnvUpgrader
 }
 
 type appUpgrader interface {
@@ -471,11 +492,13 @@ type configSelector interface {
 	appEnvSelector
 	Service(prompt, help, app string) (string, error)
 	Job(prompt, help, app string) (string, error)
+	Workload(prompt, help, app string) (string, error)
 }
 
 type deploySelector interface {
 	appSelector
-	DeployedService(prompt, help string, app string, opts ...selector.GetDeployedServiceOpts) (*selector.DeployedService, error)
+	DeployedService(prompt, help string, app string, opts ...selector.GetDeployedWorkloadOpts) (*selector.DeployedService, error)
+	DeployedJob(prompt, help string, app string, opts ...selector.GetDeployedWorkloadOpts) (*selector.DeployedJob, error)
 }
 
 type pipelineEnvSelector interface {
@@ -484,6 +507,10 @@ type pipelineEnvSelector interface {
 
 type wsPipelineSelector interface {
 	WsPipeline(prompt, help string) (*workspace.PipelineManifest, error)
+}
+
+type wsEnvironmentSelector interface {
+	LocalEnvironment(msg, help string) (wl string, err error)
 }
 
 type codePipelineSelector interface {
@@ -498,8 +525,7 @@ type wsSelector interface {
 	Workload(msg, help string) (string, error)
 }
 
-type initJobSelector interface {
-	dockerfileSelector
+type scheduleSelector interface {
 	Schedule(scheduleTypePrompt, scheduleTypeHelp string, scheduleValidator, rateValidator prompt.ValidatorFunc) (string, error)
 }
 
@@ -545,12 +571,16 @@ type roleDeleter interface {
 	DeleteRole(string) error
 }
 
+type policyLister interface {
+	ListPolicyNames() ([]string, error)
+}
+
 type serviceDescriber interface {
 	DescribeService(app, env, svc string) (*ecs.ServiceDesc, error)
 }
 
 type apprunnerServiceDescriber interface {
-	ServiceARN() (string, error)
+	ServiceARN(env string) (string, error)
 }
 
 type ecsCommandExecutor interface {
@@ -604,7 +634,7 @@ type publicIPGetter interface {
 }
 
 type cliStringer interface {
-	CLIString() string
+	CLIString() (string, error)
 }
 
 type secretPutter interface {
@@ -625,8 +655,26 @@ type workloadDeployer interface {
 	IsServiceAvailableInRegion(region string) (bool, error)
 }
 
-type workloadTemplateGenerator interface {
+type workloadStackGenerator interface {
 	UploadArtifacts() (*clideploy.UploadArtifactsOutput, error)
 	GenerateCloudFormationTemplate(in *clideploy.GenerateCloudFormationTemplateInput) (
 		*clideploy.GenerateCloudFormationTemplateOutput, error)
+	AddonsTemplate() (string, error)
+}
+
+type runner interface {
+	Run() error
+}
+
+type envDeployer interface {
+	DeployEnvironment(in *clideploy.DeployEnvironmentInput) error
+	Validate(*manifest.Environment) error
+	UploadArtifacts() (*clideploy.UploadEnvArtifactsOutput, error)
+}
+
+type envPackager interface {
+	GenerateCloudFormationTemplate(in *clideploy.DeployEnvironmentInput) (*clideploy.GenerateCloudFormationTemplateOutput, error)
+	Validate(*manifest.Environment) error
+	UploadArtifacts() (*clideploy.UploadEnvArtifactsOutput, error)
+	AddonsTemplate() (string, error)
 }

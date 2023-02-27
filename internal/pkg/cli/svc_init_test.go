@@ -6,6 +6,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -13,6 +14,7 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/docker/dockerengine"
 	"github.com/aws/copilot-cli/internal/pkg/docker/dockerfile"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"github.com/aws/copilot-cli/internal/pkg/workspace"
 
@@ -44,6 +46,7 @@ func TestSvcInitOpts_Validate(t *testing.T) {
 		inSvcPort        uint16
 		inSubscribeTags  []string
 		inNoSubscribe    bool
+		inIngressType    string
 
 		setupMocks     func(mocks initSvcMocks)
 		mockFileSystem func(mockFS afero.Fs)
@@ -76,7 +79,7 @@ func TestSvcInitOpts_Validate(t *testing.T) {
 		"fail if image not supported by App Runner": {
 			inAppName: "phonetool",
 			inImage:   "amazon/amazon-ecs-sample",
-			inSvcType: manifest.RequestDrivenWebServiceType,
+			inSvcType: manifestinfo.RequestDrivenWebServiceType,
 
 			setupMocks: func(m initSvcMocks) {
 				m.mockStore.EXPECT().GetApplication("phonetool").Return(&config.Application{}, nil)
@@ -90,7 +93,7 @@ func TestSvcInitOpts_Validate(t *testing.T) {
 			setupMocks: func(m initSvcMocks) {
 				m.mockStore.EXPECT().GetApplication("phonetool").Return(&config.Application{}, nil)
 			},
-			wantedErr: errors.New("open hello/Dockerfile: file does not exist"),
+			wantedErr: fmt.Errorf("open %s: file does not exist", filepath.FromSlash("hello/Dockerfile")),
 		},
 		"fail if both no-subscribe and subscribe are set": {
 			inAppName:       "phonetool",
@@ -101,6 +104,21 @@ func TestSvcInitOpts_Validate(t *testing.T) {
 				m.mockStore.EXPECT().GetApplication("phonetool").Return(&config.Application{}, nil)
 			},
 			wantedErr: errors.New("validate subscribe configuration: cannot specify both --no-subscribe and --subscribe-topics"),
+		},
+		"rdws invalid ingress type error": {
+			inSvcName:        "frontend",
+			inSvcType:        "Request-Driven Web Service",
+			inDockerfilePath: "./hello/Dockerfile",
+			inIngressType:    "invalid",
+
+			setupMocks: func(m initSvcMocks) {
+				m.mockStore.EXPECT().GetApplication("phonetool").Return(&config.Application{}, nil)
+			},
+			mockFileSystem: func(mockFS afero.Fs) {
+				mockFS.MkdirAll("hello", 0755)
+				afero.WriteFile(mockFS, "hello/Dockerfile", []byte("FROM nginx"), 0644)
+			},
+			wantedErr: errors.New(`invalid ingress type "invalid": must be one of Environment or Internet.`),
 		},
 		"valid flags": {
 			inSvcName:        "frontend",
@@ -114,7 +132,20 @@ func TestSvcInitOpts_Validate(t *testing.T) {
 				mockFS.MkdirAll("hello", 0755)
 				afero.WriteFile(mockFS, "hello/Dockerfile", []byte("FROM nginx"), 0644)
 			},
-			wantedErr: nil,
+		},
+		"valid rdws flags": {
+			inSvcName:        "frontend",
+			inSvcType:        "Request-Driven Web Service",
+			inDockerfilePath: "./hello/Dockerfile",
+			inIngressType:    "Internet",
+
+			setupMocks: func(m initSvcMocks) {
+				m.mockStore.EXPECT().GetApplication("phonetool").Return(&config.Application{}, nil)
+			},
+			mockFileSystem: func(mockFS afero.Fs) {
+				mockFS.MkdirAll("hello", 0755)
+				afero.WriteFile(mockFS, "hello/Dockerfile", []byte("FROM nginx"), 0644)
+			},
 		},
 	}
 
@@ -141,7 +172,8 @@ func TestSvcInitOpts_Validate(t *testing.T) {
 						subscriptions:  tc.inSubscribeTags,
 						noSubscribe:    tc.inNoSubscribe,
 					},
-					port: tc.inSvcPort,
+					port:        tc.inSvcPort,
+					ingressType: tc.inIngressType,
 				},
 				store:     mockstore,
 				fs:        &afero.Afero{Fs: afero.NewMemMapFs()},
@@ -167,8 +199,10 @@ func TestSvcInitOpts_Validate(t *testing.T) {
 func TestSvcInitOpts_Ask(t *testing.T) {
 	const (
 		mockAppName          = "phonetool"
-		wantedSvcType        = manifest.LoadBalancedWebServiceType
+		wantedSvcType        = manifestinfo.LoadBalancedWebServiceType
+		appRunnerSvcType     = manifestinfo.RequestDrivenWebServiceType
 		wantedSvcName        = "frontend"
+		badAppRunnerSvcName  = "iamoverfortycharacterlongandaninvalidrdwsname"
 		wantedDockerfilePath = "frontend/Dockerfile"
 		wantedSvcPort        = 80
 		wantedImage          = "mockImage"
@@ -183,6 +217,7 @@ func TestSvcInitOpts_Ask(t *testing.T) {
 		inSvcPort        uint16
 		inSubscribeTags  []string
 		inNoSubscribe    bool
+		inIngressType    string
 
 		setupMocks func(mocks initSvcMocks)
 
@@ -259,7 +294,7 @@ type: Backend Service`), nil)
 			},
 			wantedErr: fmt.Errorf("manifest file for service frontend exists with a different type Backend Service"),
 		},
-		"skip asking questions if local manifest file exists": {
+		"skip asking questions if local manifest file exists by flags": {
 			inSvcType: "Worker Service",
 			inSvcName: wantedSvcName,
 
@@ -267,6 +302,23 @@ type: Backend Service`), nil)
 				m.mockStore.EXPECT().GetService(mockAppName, wantedSvcName).Return(nil, &config.ErrNoSuchService{})
 				m.mockMftReader.EXPECT().ReadWorkloadManifest(wantedSvcName).Return([]byte(`
 type: Worker Service`), nil)
+			},
+		},
+		"error if invalid app runner service name": {
+			inSvcType: "Request-Driven Web Service",
+			inSvcName: badAppRunnerSvcName,
+
+			setupMocks: func(m initSvcMocks) {},
+
+			wantedErr: fmt.Errorf("service name iamoverfortycharacterlongandaninvalidrdwsname is invalid: value must not exceed 40 characters"),
+		},
+		"skip asking questions if local manifest file exists by only name flag with minimal check": {
+			inSvcName: badAppRunnerSvcName,
+
+			setupMocks: func(m initSvcMocks) {
+				m.mockStore.EXPECT().GetService(mockAppName, badAppRunnerSvcName).Return(nil, &config.ErrNoSuchService{})
+				m.mockMftReader.EXPECT().ReadWorkloadManifest(badAppRunnerSvcName).Return([]byte(`
+type: Request-Driven Web Service`), nil)
 			},
 		},
 		"return an error if fail to read local manifest": {
@@ -300,27 +352,89 @@ type: Worker Service`), nil)
 			setupMocks: func(m initSvcMocks) {
 				m.mockPrompt.EXPECT().SelectOption(gomock.Eq(fmt.Sprintf(fmtSvcInitSvcTypePrompt, "service type")), gomock.Any(), gomock.Eq([]prompt.Option{
 					{
-						Value: manifest.RequestDrivenWebServiceType,
+						Value: manifestinfo.RequestDrivenWebServiceType,
 						Hint:  "App Runner",
 					},
 					{
-						Value: manifest.LoadBalancedWebServiceType,
+						Value: manifestinfo.LoadBalancedWebServiceType,
 						Hint:  "Internet to ECS on Fargate",
 					},
 					{
-						Value: manifest.BackendServiceType,
+						Value: manifestinfo.BackendServiceType,
 						Hint:  "ECS on Fargate",
 					},
 					{
-						Value: manifest.WorkerServiceType,
+						Value: manifestinfo.WorkerServiceType,
 						Hint:  "Events to SQS to ECS on Fargate",
 					},
 				}), gomock.Any()).
 					Return(wantedSvcType, nil)
+				m.mockStore.EXPECT().GetService(mockAppName, wantedSvcName).Return(nil, &config.ErrNoSuchService{}).Times(2)
+				m.mockMftReader.EXPECT().ReadWorkloadManifest(wantedSvcName).Return(nil, &workspace.ErrFileNotExists{FileName: wantedSvcName}).Times(2)
+			},
+			wantedErr: nil,
+		},
+		"prompt for service type and error if the name is invalid": {
+			inSvcType: "",
+			inSvcName: badAppRunnerSvcName,
+
+			setupMocks: func(m initSvcMocks) {
+				m.mockPrompt.EXPECT().SelectOption(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(appRunnerSvcType, nil)
+				m.mockStore.EXPECT().GetService(mockAppName, badAppRunnerSvcName).Return(nil, &config.ErrNoSuchService{})
+				m.mockMftReader.EXPECT().ReadWorkloadManifest(badAppRunnerSvcName).Return(nil, &workspace.ErrFileNotExists{FileName: badAppRunnerSvcName})
+			},
+			wantedErr: fmt.Errorf("service name iamoverfortycharacterlongandaninvalidrdwsname is invalid: value must not exceed 40 characters"),
+		},
+		"rdws prompt for ingress type": {
+			inSvcType:        appRunnerSvcType,
+			inSvcName:        wantedSvcName,
+			inSvcPort:        wantedSvcPort,
+			inDockerfilePath: wantedDockerfilePath,
+
+			setupMocks: func(m initSvcMocks) {
+				m.mockStore.EXPECT().GetService(mockAppName, wantedSvcName).Return(nil, &config.ErrNoSuchService{})
+				m.mockMftReader.EXPECT().ReadWorkloadManifest(wantedSvcName).Return(nil, &workspace.ErrFileNotExists{FileName: wantedSvcName})
+				m.mockPrompt.EXPECT().SelectOption(gomock.Eq(svcInitIngressTypePrompt), gomock.Any(), gomock.Eq([]prompt.Option{
+					{
+						Value: "Environment",
+					},
+					{
+						Value: "Internet",
+					},
+				}), gomock.Any()).Return("Environment", nil)
+			},
+		},
+		"rdws prompt for ingress type error": {
+			inSvcType:        appRunnerSvcType,
+			inSvcName:        wantedSvcName,
+			inSvcPort:        wantedSvcPort,
+			inDockerfilePath: wantedDockerfilePath,
+
+			setupMocks: func(m initSvcMocks) {
+				m.mockStore.EXPECT().GetService(mockAppName, wantedSvcName).Return(nil, &config.ErrNoSuchService{})
+				m.mockPrompt.EXPECT().SelectOption(gomock.Eq(svcInitIngressTypePrompt), gomock.Any(), gomock.Eq([]prompt.Option{
+					{
+						Value: "Environment",
+					},
+					{
+						Value: "Internet",
+					},
+				}), gomock.Any()).Return("", errors.New("some error"))
+			},
+			wantedErr: errors.New("select ingress type: some error"),
+		},
+		"rdws skip ingress type prompt with flag": {
+			inSvcType:        appRunnerSvcType,
+			inSvcName:        wantedSvcName,
+			inSvcPort:        wantedSvcPort,
+			inDockerfilePath: wantedDockerfilePath,
+			inIngressType:    ingressTypeInternet,
+
+			setupMocks: func(m initSvcMocks) {
 				m.mockStore.EXPECT().GetService(mockAppName, wantedSvcName).Return(nil, &config.ErrNoSuchService{})
 				m.mockMftReader.EXPECT().ReadWorkloadManifest(wantedSvcName).Return(nil, &workspace.ErrFileNotExists{FileName: wantedSvcName})
 			},
-			wantedErr: nil,
 		},
 		"skip selecting Dockerfile if image flag is set": {
 			inSvcType:        wantedSvcType,
@@ -617,7 +731,8 @@ type: Worker Service`), nil)
 						subscriptions:  tc.inSubscribeTags,
 						appName:        mockAppName,
 					},
-					port: tc.inSvcPort,
+					port:        tc.inSvcPort,
+					ingressType: tc.inIngressType,
 				},
 				store: mockStore,
 				fs:    &afero.Afero{Fs: afero.NewMemMapFs()},
@@ -640,7 +755,6 @@ type: Worker Service`), nil)
 				require.EqualError(t, err, tc.wantedErr.Error())
 			} else {
 				require.NoError(t, err)
-				require.Equal(t, wantedSvcName, opts.name)
 				if opts.dockerfilePath != "" {
 					require.Equal(t, wantedDockerfilePath, opts.dockerfilePath)
 				}
@@ -653,17 +767,31 @@ type: Worker Service`), nil)
 }
 
 func TestSvcInitOpts_Execute(t *testing.T) {
+	mockEnvironmentManifest := []byte(`name: test
+type: Environment
+network:
+  vpc:
+   id: 'vpc-mockid'
+   subnets:
+      private:
+        - id: 'subnet-1'
+        - id: 'subnet-2'
+        - id: 'subnet-3'
+        - id: 'subnet-4'`)
 	testCases := map[string]struct {
 		mockSvcInit      func(m *mocks.MocksvcInitializer)
 		mockDockerfile   func(m *mocks.MockdockerfileParser)
 		mockDockerEngine func(m *mocks.MockdockerEngine)
 		mockTopicSel     func(m *mocks.MocktopicSelector)
+		mockStore        func(m *mocks.Mockstore)
+		mockEnvDescriber func(m *mocks.MockenvDescriber)
 		inSvcPort        uint16
 		inSvcType        string
 		inSvcName        string
 		inDockerfilePath string
 		inImage          string
 		inAppName        string
+		inManifestExists bool
 
 		wantedErr          error
 		wantedManifestPath string
@@ -672,7 +800,7 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 			inAppName:        "sample",
 			inSvcName:        "frontend",
 			inDockerfilePath: "./Dockerfile",
-			inSvcType:        manifest.LoadBalancedWebServiceType,
+			inSvcType:        manifestinfo.LoadBalancedWebServiceType,
 
 			inSvcPort: 80,
 
@@ -692,16 +820,19 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 				m.EXPECT().GetHealthCheck().Return(nil, nil)
 			},
 			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(nil)
 				m.EXPECT().GetPlatform().Return("linux", "amd64", nil)
 			},
-
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return(nil, nil)
+			},
 			wantedManifestPath: "manifest/path",
 		},
 		"backend service": {
 			inAppName:        "sample",
 			inSvcName:        "frontend",
 			inDockerfilePath: "./Dockerfile",
-			inSvcType:        manifest.BackendServiceType,
+			inSvcType:        manifestinfo.BackendServiceType,
 
 			mockSvcInit: func(m *mocks.MocksvcInitializer) {
 				m.EXPECT().Service(&initialize.ServiceProps{
@@ -718,7 +849,73 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 				m.EXPECT().GetHealthCheck().Return(nil, nil)
 			},
 			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(nil)
 				m.EXPECT().GetPlatform().Return("linux", "amd64", nil)
+			},
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return(nil, nil)
+			},
+			wantedManifestPath: "manifest/path",
+		},
+		"doesn't attempt to detect and populate the platform if manifest already exists": {
+			inAppName:        "sample",
+			inSvcName:        "frontend",
+			inDockerfilePath: "./Dockerfile",
+			inSvcType:        manifestinfo.LoadBalancedWebServiceType,
+			inSvcPort:        80,
+			inManifestExists: true,
+
+			mockDockerfile: func(m *mocks.MockdockerfileParser) {
+				m.EXPECT().GetHealthCheck().Return(nil, nil)
+			},
+			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Times(0)
+				m.EXPECT().GetPlatform().Times(0)
+			},
+			mockSvcInit: func(m *mocks.MocksvcInitializer) {
+				m.EXPECT().Service(&initialize.ServiceProps{
+					WorkloadProps: initialize.WorkloadProps{
+						App:            "sample",
+						Name:           "frontend",
+						Type:           "Load Balanced Web Service",
+						DockerfilePath: "./Dockerfile",
+					},
+					Port: 80,
+				}).Return("manifest/path", nil)
+			},
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return(nil, nil)
+			},
+			wantedManifestPath: "manifest/path",
+		},
+		"doesn't complain if docker is unavailable": {
+			inAppName:        "sample",
+			inSvcName:        "frontend",
+			inDockerfilePath: "./Dockerfile",
+			inSvcType:        manifestinfo.LoadBalancedWebServiceType,
+
+			inSvcPort: 80,
+
+			mockDockerfile: func(m *mocks.MockdockerfileParser) {
+				m.EXPECT().GetHealthCheck().Return(nil, nil)
+			},
+			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(&dockerengine.ErrDockerDaemonNotResponsive{})
+				m.EXPECT().GetPlatform().Times(0)
+			},
+			mockSvcInit: func(m *mocks.MocksvcInitializer) {
+				m.EXPECT().Service(&initialize.ServiceProps{
+					WorkloadProps: initialize.WorkloadProps{
+						App:            "sample",
+						Name:           "frontend",
+						Type:           "Load Balanced Web Service",
+						DockerfilePath: "./Dockerfile",
+					},
+					Port: 80,
+				}).Return("manifest/path", nil)
+			},
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return(nil, nil)
 			},
 
 			wantedManifestPath: "manifest/path",
@@ -727,7 +924,7 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 			inAppName:        "sample",
 			inSvcName:        "frontend",
 			inDockerfilePath: "./Dockerfile",
-			inSvcType:        manifest.LoadBalancedWebServiceType,
+			inSvcType:        manifestinfo.LoadBalancedWebServiceType,
 
 			inSvcPort: 80,
 
@@ -749,7 +946,11 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 				m.EXPECT().GetHealthCheck().Return(nil, nil)
 			},
 			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(nil)
 				m.EXPECT().GetPlatform().Return("windows", "amd64", nil)
+			},
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return(nil, nil)
 			},
 
 			wantedManifestPath: "manifest/path",
@@ -758,7 +959,7 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 			inAppName:        "sample",
 			inSvcName:        "frontend",
 			inDockerfilePath: "./Dockerfile",
-			inSvcType:        manifest.LoadBalancedWebServiceType,
+			inSvcType:        manifestinfo.LoadBalancedWebServiceType,
 
 			inSvcPort: 80,
 
@@ -780,7 +981,11 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 				m.EXPECT().GetHealthCheck().Return(nil, nil)
 			},
 			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(nil)
 				m.EXPECT().GetPlatform().Return("linux", "arm", nil)
+			},
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return(nil, nil)
 			},
 
 			wantedManifestPath: "manifest/path",
@@ -789,7 +994,7 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 			inAppName:        "sample",
 			inSvcName:        "frontend",
 			inDockerfilePath: "./Dockerfile",
-			inSvcType:        manifest.WorkerServiceType,
+			inSvcType:        manifestinfo.WorkerServiceType,
 
 			mockSvcInit: func(m *mocks.MocksvcInitializer) {
 				m.EXPECT().Service(&initialize.ServiceProps{
@@ -806,6 +1011,7 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 				m.EXPECT().GetHealthCheck().Return(nil, nil)
 			},
 			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(nil)
 				m.EXPECT().GetPlatform().Return("linux", "amd64", nil)
 			},
 			mockTopicSel: func(m *mocks.MocktopicSelector) {
@@ -820,6 +1026,9 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 					},
 				}, nil)
 			},
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return(nil, nil)
+			},
 
 			wantedManifestPath: "manifest/path",
 		},
@@ -828,7 +1037,7 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 			inSvcName:        "backend",
 			inDockerfilePath: "",
 			inImage:          "nginx:latest",
-			inSvcType:        manifest.BackendServiceType,
+			inSvcType:        manifestinfo.BackendServiceType,
 
 			mockSvcInit: func(m *mocks.MocksvcInitializer) {
 				m.EXPECT().Service(&initialize.ServiceProps{
@@ -842,6 +1051,9 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 				}).Return("manifest/path", nil)
 			},
 			mockDockerfile: func(m *mocks.MockdockerfileParser) {}, // Be sure that no dockerfile parsing happens.
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return(nil, nil)
+			},
 
 			wantedManifestPath: "manifest/path",
 		},
@@ -850,7 +1062,7 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 			inSvcName:        "frontend",
 			inDockerfilePath: "",
 			inImage:          "nginx:latest",
-			inSvcType:        manifest.LoadBalancedWebServiceType,
+			inSvcType:        manifestinfo.LoadBalancedWebServiceType,
 
 			mockSvcInit: func(m *mocks.MocksvcInitializer) {
 				m.EXPECT().Service(&initialize.ServiceProps{
@@ -864,11 +1076,15 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 				}).Return("manifest/path", nil)
 			},
 			mockDockerfile: func(m *mocks.MockdockerfileParser) {}, // Be sure that no dockerfile parsing happens.
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return(nil, nil)
+			},
 
 			wantedManifestPath: "manifest/path",
 		},
 		"return error if platform detection fails": {
 			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(nil)
 				m.EXPECT().GetPlatform().Return("", "", errors.New("some error"))
 			},
 			wantedErr: errors.New("get docker engine platform: some error"),
@@ -877,7 +1093,7 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 			inAppName:        "sample",
 			inSvcName:        "appRunner",
 			inDockerfilePath: "./Dockerfile",
-			inSvcType:        manifest.RequestDrivenWebServiceType,
+			inSvcType:        manifestinfo.RequestDrivenWebServiceType,
 
 			inSvcPort: 80,
 
@@ -885,19 +1101,90 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 				m.EXPECT().GetHealthCheck().Return(nil, nil)
 			},
 			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(nil)
 				m.EXPECT().GetPlatform().Return("windows", "amd64", nil)
 			},
-
 			wantedErr: errors.New("redirect docker engine platform: Windows is not supported for App Runner services"),
 		},
 		"failure": {
 			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(nil)
 				m.EXPECT().GetPlatform().Return("linux", "amd64", nil)
 			},
-			mockSvcInit: func(m *mocks.MocksvcInitializer) {
-				m.EXPECT().Service(gomock.Any()).Return("", errors.New("some error"))
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("").Return(nil, errors.New("some error"))
 			},
-			wantedErr: errors.New("some error"),
+			wantedErr: errors.New("list environments for application : some error"),
+		},
+		"initalize a service in environments with only private subnets": {
+			inAppName:        "sample",
+			inSvcName:        "frontend",
+			inDockerfilePath: "./Dockerfile",
+			inSvcType:        manifestinfo.LoadBalancedWebServiceType,
+
+			inSvcPort: 80,
+
+			mockSvcInit: func(m *mocks.MocksvcInitializer) {
+				m.EXPECT().Service(&initialize.ServiceProps{
+					WorkloadProps: initialize.WorkloadProps{
+						App:            "sample",
+						Name:           "frontend",
+						Type:           "Load Balanced Web Service",
+						DockerfilePath: "./Dockerfile",
+						Platform:       manifest.PlatformArgsOrString{},
+						PrivateOnlyEnvironments: []string{
+							"test",
+						},
+					},
+					Port: 80,
+				}).Return("manifest/path", nil)
+			},
+			mockDockerfile: func(m *mocks.MockdockerfileParser) {
+				m.EXPECT().GetHealthCheck().Return(nil, nil)
+			},
+			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(nil)
+				m.EXPECT().GetPlatform().Return("linux", "amd64", nil)
+			},
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return([]*config.Environment{
+					{
+						App:  "sample",
+						Name: "test",
+					},
+				}, nil)
+			},
+			mockEnvDescriber: func(m *mocks.MockenvDescriber) {
+				m.EXPECT().Manifest().Return(mockEnvironmentManifest, nil)
+			},
+			wantedManifestPath: "manifest/path",
+		},
+		"error if fail to read the manifest": {
+			inAppName:        "sample",
+			inSvcName:        "frontend",
+			inDockerfilePath: "./Dockerfile",
+			inSvcType:        manifestinfo.LoadBalancedWebServiceType,
+
+			inSvcPort: 80,
+			mockDockerfile: func(m *mocks.MockdockerfileParser) {
+				m.EXPECT().GetHealthCheck().Return(nil, nil)
+			},
+			mockDockerEngine: func(m *mocks.MockdockerEngine) {
+				m.EXPECT().CheckDockerEngineRunning().Return(nil)
+				m.EXPECT().GetPlatform().Return("linux", "amd64", nil)
+			},
+			mockStore: func(m *mocks.Mockstore) {
+				m.EXPECT().ListEnvironments("sample").Return([]*config.Environment{
+					{
+						App:  "sample",
+						Name: "test",
+					},
+				}, nil)
+			},
+			mockEnvDescriber: func(m *mocks.MockenvDescriber) {
+				m.EXPECT().Manifest().Return(nil, errors.New("failed to read manifest"))
+			},
+			wantedErr: errors.New("read the manifest used to deploy environment test: failed to read manifest"),
 		},
 	}
 
@@ -911,6 +1198,12 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 			mockDockerfile := mocks.NewMockdockerfileParser(ctrl)
 			mockDockerEngine := mocks.NewMockdockerEngine(ctrl)
 			mockTopicSel := mocks.NewMocktopicSelector(ctrl)
+			mockStore := mocks.NewMockstore(ctrl)
+			mockEnvDescriber := mocks.NewMockenvDescriber(ctrl)
+
+			if tc.mockStore != nil {
+				tc.mockStore(mockStore)
+			}
 
 			if tc.mockSvcInit != nil {
 				tc.mockSvcInit(mockSvcInitializer)
@@ -920,6 +1213,9 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 			}
 			if tc.mockDockerEngine != nil {
 				tc.mockDockerEngine(mockDockerEngine)
+			}
+			if tc.mockEnvDescriber != nil {
+				tc.mockEnvDescriber(mockEnvDescriber)
 			}
 			opts := initSvcOpts{
 				initSvcVars: initSvcVars{
@@ -936,9 +1232,14 @@ func TestSvcInitOpts_Execute(t *testing.T) {
 				dockerfile: func(s string) dockerfileParser {
 					return mockDockerfile
 				},
-				df:           mockDockerfile,
-				dockerEngine: mockDockerEngine,
-				topicSel:     mockTopicSel,
+				df:             mockDockerfile,
+				dockerEngine:   mockDockerEngine,
+				store:          mockStore,
+				topicSel:       mockTopicSel,
+				manifestExists: tc.inManifestExists,
+				initEnvDescriber: func(string, string) (envDescriber, error) {
+					return mockEnvDescriber, nil
+				},
 			}
 
 			// WHEN
